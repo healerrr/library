@@ -1,5 +1,6 @@
 import hashlib
 import re
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urldefrag
@@ -168,6 +169,16 @@ class CrawlerService:
         blocks_saved = 0
         timeout = httpx.Timeout(self.settings.crawler_timeout_seconds)
         headers = {"User-Agent": self.settings.crawler_user_agent, "Accept": "text/html,application/xml;q=0.9,*/*;q=0.8"}
+        stored_rows = (
+            await session.execute(
+                select(ContentBlock.page_id, ContentBlock.content_hash).where(ContentBlock.site_id == site_id)
+            )
+        ).all()
+        stored_hash_counts = Counter(content_digest for _, content_digest in stored_rows)
+        stored_hashes_by_page: dict[int, list[str]] = defaultdict(list)
+        for page_id, content_digest in stored_rows:
+            stored_hashes_by_page[page_id].append(content_digest)
+        hashes_saved_this_crawl: set[str] = set()
 
         async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
             page_urls = await self._sitemap_urls(client, sitemap_url, domains)
@@ -178,10 +189,17 @@ class CrawlerService:
                     if "html" not in content_type and not response.text.lstrip().lower().startswith("<!doctype html"):
                         errors.append(f"{url}: 不是 HTML 页面")
                         continue
-                    extracted = extract_page(response.text)
                     page = await session.scalar(select(Page).where(Page.site_id == site_id, Page.url == url))
                     now = datetime.now(timezone.utc)
                     page_digest = hashlib.sha256(response.content).hexdigest()
+                    if page is not None and page.content_hash == page_digest:
+                        page.http_status = response.status_code
+                        page.crawled_at = now
+                        await session.commit()
+                        pages_crawled += 1
+                        continue
+
+                    extracted = extract_page(response.text)
                     if page is None:
                         page = Page(site_id=site_id, url=url)
                         session.add(page)
@@ -191,11 +209,24 @@ class CrawlerService:
                     page.content_hash = page_digest
                     page.crawled_at = now
                     await session.flush()
+
+                    for old_digest in stored_hashes_by_page.pop(page.id, []):
+                        stored_hash_counts[old_digest] -= 1
+                        if stored_hash_counts[old_digest] <= 0:
+                            del stored_hash_counts[old_digest]
                     await session.execute(delete(ContentBlock).where(ContentBlock.page_id == page.id))
 
-                    embed_inputs = [embedding_text(text) for _, text in extracted.blocks]
+                    unique_blocks: list[tuple[str, str, str]] = []
+                    for block_type, text in extracted.blocks:
+                        block_digest = content_hash(text)
+                        if block_digest in stored_hash_counts or block_digest in hashes_saved_this_crawl:
+                            continue
+                        hashes_saved_this_crawl.add(block_digest)
+                        unique_blocks.append((block_type, text, block_digest))
+
+                    embed_inputs = [embedding_text(text) for _, text, _ in unique_blocks]
                     vectors = await self.embedding_service.embed(embed_inputs)
-                    for (block_type, text), vector in zip(extracted.blocks, vectors, strict=True):
+                    for (block_type, text, block_digest), vector in zip(unique_blocks, vectors, strict=True):
                         session.add(
                             ContentBlock(
                                 site_id=site_id,
@@ -205,18 +236,19 @@ class CrawlerService:
                                 content_type=block_type,
                                 original_content=text,
                                 normalized_content=normalize_text(text),
-                                content_hash=content_hash(text),
+                                content_hash=block_digest,
                                 embedding=vector,
                                 collected_at=now,
                             )
                         )
                     await session.commit()
                     pages_crawled += 1
-                    blocks_saved += len(extracted.blocks)
+                    blocks_saved += len(unique_blocks)
                 except Exception as exc:  # Keep one bad page from aborting the site crawl.
                     await session.rollback()
                     errors.append(f"{url}: {str(exc)[:180]}")
 
+        await deduplicate_site_blocks(session, site_id)
         managed_site = await session.get(Site, site_id)
         if managed_site is not None:
             managed_site.last_crawled_at = datetime.now(timezone.utc)
@@ -229,3 +261,26 @@ class CrawlerService:
             "blocks_saved": blocks_saved,
             "errors": errors[:30],
         }
+
+
+async def deduplicate_site_blocks(session: AsyncSession, site_id: int) -> int:
+    """Remove legacy duplicate fragments while keeping the oldest source record."""
+    blocks = list(
+        (
+            await session.scalars(
+                select(ContentBlock)
+                .where(ContentBlock.site_id == site_id)
+                .order_by(ContentBlock.id.asc())
+            )
+        ).all()
+    )
+    seen_hashes: set[str] = set()
+    duplicate_ids: list[int] = []
+    for block in blocks:
+        if block.content_hash in seen_hashes:
+            duplicate_ids.append(block.id)
+        else:
+            seen_hashes.add(block.content_hash)
+    if duplicate_ids:
+        await session.execute(delete(ContentBlock).where(ContentBlock.id.in_(duplicate_ids)))
+    return len(duplicate_ids)

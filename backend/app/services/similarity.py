@@ -1,3 +1,5 @@
+import math
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -22,6 +24,18 @@ def risk_level(score: float) -> str:
     return "low"
 
 
+def cosine_similarity(left: list[float], right: list[float]) -> float:
+    """Compute cosine similarity for the SQLite fallback path."""
+    if not left or not right or len(left) != len(right):
+        return 0.0
+    dot_product = math.fsum(a * b for a, b in zip(left, right, strict=True))
+    left_norm = math.sqrt(math.fsum(value * value for value in left))
+    right_norm = math.sqrt(math.fsum(value * value for value in right))
+    if not left_norm or not right_norm:
+        return 0.0
+    return dot_product / (left_norm * right_norm)
+
+
 class SimilarityService:
     def __init__(self, settings: Settings, embedding_service: EmbeddingService):
         self.settings = settings
@@ -33,14 +47,26 @@ class SimilarityService:
         query_core, query_chemical_ratio = strip_chemical_fields(content)
         query_vector = (await self.embedding_service.embed([embedding_text(content)]))[0]
 
-        distance = ContentBlock.embedding.cosine_distance(query_vector)
-        statement = (
-            select(ContentBlock, Site.name.label("site_name"), (1 - distance).label("semantic_score"))
-            .join(Site, Site.id == ContentBlock.site_id)
-            .order_by(distance)
-            .limit(self.settings.similarity_candidate_limit)
-        )
-        rows = list((await session.execute(statement)).all())
+        if session.get_bind().dialect.name == "sqlite":
+            statement = select(ContentBlock, Site.name.label("site_name")).join(
+                Site, Site.id == ContentBlock.site_id
+            )
+            sqlite_rows = list((await session.execute(statement)).all())
+            rows = [
+                (block, site_name, cosine_similarity(query_vector, block.embedding))
+                for block, site_name in sqlite_rows
+            ]
+            rows.sort(key=lambda row: row[2], reverse=True)
+            rows = rows[: self.settings.similarity_candidate_limit]
+        else:
+            distance = ContentBlock.embedding.cosine_distance(query_vector)
+            statement = (
+                select(ContentBlock, Site.name.label("site_name"), (1 - distance).label("semantic_score"))
+                .join(Site, Site.id == ContentBlock.site_id)
+                .order_by(distance)
+                .limit(self.settings.similarity_candidate_limit)
+            )
+            rows = list((await session.execute(statement)).all())
 
         exact_statement = (
             select(ContentBlock, Site.name.label("site_name"))

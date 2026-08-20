@@ -30,6 +30,11 @@ from app.services.ssrf import UnsafeUrlError, validate_url_format
 router = APIRouter(prefix="/api")
 
 
+def is_unique_violation(exc: IntegrityError) -> bool:
+    original = exc.orig
+    return getattr(original, "sqlstate", None) == "23505" or "unique constraint" in str(original).lower()
+
+
 def site_dict(site: Site, page_count: int = 0, block_count: int = 0) -> dict:
     return {
         "id": site.id,
@@ -82,7 +87,9 @@ async def create_site(payload: SiteCreate, session: AsyncSession = Depends(get_s
         await session.refresh(site)
     except IntegrityError as exc:
         await session.rollback()
-        raise HTTPException(status_code=409, detail="该域名已经添加") from exc
+        if is_unique_violation(exc):
+            raise HTTPException(status_code=409, detail="该域名已经添加") from exc
+        raise
     return site_dict(site)
 
 
@@ -221,4 +228,3 @@ async def check_similarity(
 ):
     service = SimilarityService(settings, get_embedding_service())
     return await service.check(session, payload.content, payload.limit)
-

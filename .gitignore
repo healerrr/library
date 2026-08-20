@@ -4,9 +4,9 @@ __pycache__/
 .pytest_cache/
 *.py[cod]
 backend/.coverage
+backend/.data/
 frontend/.nuxt/
 frontend/.output/
 frontend/node_modules/
 frontend/.data/
 .DS_Store
-

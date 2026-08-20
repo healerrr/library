@@ -48,7 +48,7 @@ class EmbeddingService:
         return vectors
 
     def _hashing_embedding(self, text: str) -> list[float]:
-        """Deterministic offline provider used by unit tests, never the production default."""
+        """Deterministic offline provider for local development and unit tests."""
         dimension = self.settings.embedding_dimension
         vector = [0.0] * dimension
         tokens = [text[i : i + 2] for i in range(max(1, len(text) - 1))] or [text]
@@ -64,4 +64,3 @@ class EmbeddingService:
 @lru_cache
 def get_embedding_service() -> EmbeddingService:
     return EmbeddingService(get_settings())
-

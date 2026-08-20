@@ -17,15 +17,25 @@ services:
   backend:
     build:
       context: ./backend
-    env_file:
-      - .env
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://copyguard:change-me@db:5432/copyguard}
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-fastembed}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-BAAI/bge-small-zh-v1.5}
+      EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-512}
       FASTEMBED_CACHE_PATH: /models
+      SIMILARITY_LEXICAL_WEIGHT: ${SIMILARITY_LEXICAL_WEIGHT:-0.45}
+      SIMILARITY_SEMANTIC_WEIGHT: ${SIMILARITY_SEMANTIC_WEIGHT:-0.55}
+      SIMILARITY_CHEMICAL_DISCOUNT: ${SIMILARITY_CHEMICAL_DISCOUNT:-0.70}
+      SIMILARITY_MIN_SCORE: ${SIMILARITY_MIN_SCORE:-0.60}
+      SIMILARITY_CANDIDATE_LIMIT: ${SIMILARITY_CANDIDATE_LIMIT:-200}
+      CRAWLER_MAX_PAGES: ${CRAWLER_MAX_PAGES:-100}
+      CRAWLER_TIMEOUT_SECONDS: ${CRAWLER_TIMEOUT_SECONDS:-15}
+      CRAWLER_USER_AGENT: ${CRAWLER_USER_AGENT:-CopyGuardBot/1.0}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
     volumes:
       - embedding_models:/models
     ports:
-      - "8000:8000"
+      - "${BACKEND_PORT:-8001}:8000"
     depends_on:
       db:
         condition: service_healthy
@@ -35,7 +45,7 @@ services:
     build:
       context: ./frontend
     environment:
-      NUXT_PUBLIC_API_BASE: ${NUXT_PUBLIC_API_BASE:-http://localhost:8000/api}
+      NUXT_PUBLIC_API_BASE: ${NUXT_PUBLIC_API_BASE:-http://localhost:8001/api}
     ports:
       - "3000:3000"
     depends_on:
@@ -45,4 +55,3 @@ services:
 volumes:
   postgres_data:
   embedding_models:
-

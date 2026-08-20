@@ -1,6 +1,6 @@
 interface ApiOptions {
   method?: 'GET' | 'POST' | 'PATCH' | 'DELETE'
-  body?: unknown
+  body?: Record<string, unknown>
   query?: Record<string, string | number | undefined | null>
 }
 
@@ -25,4 +25,3 @@ export function useApi() {
 
   return { api }
 }
-

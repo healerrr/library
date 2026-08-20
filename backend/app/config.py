@@ -8,9 +8,11 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     app_name: str = "站群文案相似度检测系统"
-    database_url: str = "postgresql+asyncpg://copyguard:change-me@localhost:5432/copyguard"
+    # SQLite keeps local development self-contained. Docker Compose overrides
+    # this with PostgreSQL/pgvector for production-style deployments.
+    database_url: str = "sqlite+aiosqlite:///./.data/copyguard-local.db"
 
-    embedding_provider: str = "fastembed"
+    embedding_provider: str = "hashing"
     embedding_model: str = "BAAI/bge-small-zh-v1.5"
     embedding_dimension: int = 512
     fastembed_cache_path: str = ".data/fastembed"
@@ -44,4 +46,3 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
-
