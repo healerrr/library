@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes import router
 from app.config import get_settings
-from app.database import close_database, initialize_database
+from app.database import close_database, initialize_database, recover_interrupted_jobs
 
 
 settings = get_settings()
@@ -14,6 +14,7 @@ settings = get_settings()
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     await initialize_database()
+    await recover_interrupted_jobs()
     try:
         yield
     finally:

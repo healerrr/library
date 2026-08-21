@@ -1,21 +1,21 @@
 import hashlib
 import re
-from collections import Counter, defaultdict
+import asyncio
+from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from urllib.parse import urljoin, urldefrag
+from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urldefrag, urlsplit, urlunsplit
 
 import httpx
 from bs4 import BeautifulSoup
-from lxml import etree
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
-from app.models import ContentBlock, Page, Site
+from app.models import ContentBlock, CrawlRun, Page, Site
 from app.services.embeddings import EmbeddingService
-from app.services.ssrf import UnsafeUrlError, validate_target_url
-from app.services.text import clean_display_text, content_hash, embedding_text, normalize_text
+from app.services.ssrf import UnsafeUrlError, canonical_domain, validate_target_url
+from app.services.text import CAS_RE, clean_display_text, content_hash, embedding_text, normalize_text
 
 
 REMOVE_SELECTORS = [
@@ -50,6 +50,85 @@ BOILERPLATE_RE = re.compile(
     r"网站地图|返回顶部|技术支持)",
     re.IGNORECASE,
 )
+PRODUCT_PATH_HINTS = {"pro", "prod", "product", "products", "goods", "item", "product-detail", "product_detail"}
+PRODUCT_DATA_ROUTE_HINTS = {
+    "catalog",
+    "category",
+    "goods",
+    "inventory",
+    "item",
+    "pro",
+    "prod",
+    "product",
+    "products",
+    "structuresearch",
+}
+PRODUCT_DATA_PATTERNS = [
+    re.compile(r"(?:catalog\s*(?:no\.?|number)|货号|产品编号|商品编号)\s*[:：]", re.IGNORECASE),
+    re.compile(r"(?:molecular\s*formula|分子式)\s*[:：]", re.IGNORECASE),
+    re.compile(r"(?:molecular\s*weight|mol\.?\s*wt\.?|分子量)\s*[:：]", re.IGNORECASE),
+    re.compile(r"(?:purity|纯度)\s*[:：]", re.IGNORECASE),
+]
+CONTENT_PATH_HINTS = {
+    "about",
+    "article",
+    "blog",
+    "capabilities",
+    "company",
+    "contact",
+    "custom",
+    "news",
+    "research",
+    "service",
+    "services",
+    "solution",
+    "solutions",
+    "technology",
+}
+SKIP_PATH_HINTS = {
+    "account",
+    "cart",
+    "checkout",
+    "compare",
+    "cdn-cgi",
+    "download",
+    "findpwd",
+    "login",
+    "logout",
+    "register",
+    "search",
+    "sign_in",
+    "sign_up",
+    "signin",
+    "signup",
+    "points_mall",
+}
+SKIP_FILE_EXTENSIONS = {
+    ".7z",
+    ".avi",
+    ".css",
+    ".csv",
+    ".doc",
+    ".docx",
+    ".gif",
+    ".gz",
+    ".ico",
+    ".jpeg",
+    ".jpg",
+    ".js",
+    ".json",
+    ".mp3",
+    ".mp4",
+    ".pdf",
+    ".png",
+    ".rar",
+    ".svg",
+    ".webp",
+    ".xls",
+    ".xlsx",
+    ".xml",
+    ".zip",
+}
 
 
 @dataclass
@@ -57,6 +136,136 @@ class ExtractedPage:
     title: str | None
     meta_description: str | None
     blocks: list[tuple[str, str]]
+
+
+def is_dynamic_product_url(url: str) -> bool:
+    path_segments = [segment.lower() for segment in unquote(urlsplit(url).path).split("/") if segment]
+    if len(path_segments) < 2 or not any(segment in PRODUCT_PATH_HINTS for segment in path_segments[:-1]):
+        return False
+    return bool(CAS_RE.search(path_segments[-1]))
+
+
+def is_product_data_url(url: str) -> bool:
+    """Identify product search, catalog, category, and detail routes."""
+    path_segments = [segment.lower() for segment in unquote(urlsplit(url).path).split("/") if segment]
+    return bool(path_segments and path_segments[0] in PRODUCT_DATA_ROUTE_HINTS)
+
+
+def is_dynamic_product_page(
+    url: str,
+    title: str | None,
+    meta_description: str | None,
+    blocks: list[tuple[str, str]] | None = None,
+) -> bool:
+    if is_dynamic_product_url(url):
+        return True
+    # Home and section pages often contain several product cards.  Treating the
+    # aggregate page text as one product would discard the very pages from
+    # which the crawler discovers useful editorial links.
+    if urlsplit(url).path.rstrip("/") == "":
+        return False
+    text = " ".join(
+        value
+        for value in [title or "", meta_description or "", *(item[1] for item in blocks or [])]
+        if value
+    )
+    marker_count = sum(bool(pattern.search(text)) for pattern in PRODUCT_DATA_PATTERNS)
+    return bool(CAS_RE.search(text)) and marker_count >= 2
+
+
+def normalize_internal_link(
+    href: str,
+    base_url: str,
+    domains: set[str],
+    allowed_query_params: set[str] | None = None,
+) -> str | None:
+    href = href.strip()
+    if not href or href.startswith(("#", "javascript:", "mailto:", "tel:")):
+        return None
+    candidate = urldefrag(urljoin(base_url, href)).url
+    parsed = urlsplit(candidate)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return None
+    allowed_hosts = {canonical_domain(domain) for domain in domains}
+    if canonical_domain(parsed.hostname) not in allowed_hosts:
+        return None
+    path = unquote(parsed.path).lower()
+    if any(path.endswith(extension) for extension in SKIP_FILE_EXTENSIONS):
+        return None
+    segments = {segment for segment in path.split("/") if segment}
+    if segments & SKIP_PATH_HINTS:
+        return None
+    # Collapse harmless homepage variants so http/https and a missing trailing
+    # slash cannot consume multiple crawl slots.
+    scheme = urlsplit(base_url).scheme or parsed.scheme
+    host = parsed.hostname.lower()
+    port = f":{parsed.port}" if parsed.port and parsed.port not in {80, 443} else ""
+    normalized_path = parsed.path or "/"
+    allowed_query_params = allowed_query_params or set()
+    query = urlencode(
+        sorted(
+            (key, value)
+            for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+            if key in allowed_query_params
+        )
+    )
+    return urlunsplit((scheme, f"{host}{port}", normalized_path, query, ""))
+
+
+def extract_internal_links(
+    html: str,
+    base_url: str,
+    domains: set[str],
+    allowed_query_params: set[str] | None = None,
+) -> list[str]:
+    soup = BeautifulSoup(html, "lxml")
+    links = {
+        normalized
+        for element in soup.select("a[href]")
+        if (
+            normalized := normalize_internal_link(
+                str(element.get("href", "")),
+                base_url,
+                domains,
+                allowed_query_params,
+            )
+        )
+    }
+    return sorted(links, key=crawl_link_priority)
+
+
+def crawl_link_priority(url: str) -> tuple[int, int, str]:
+    segments = [segment.lower() for segment in unquote(urlsplit(url).path).split("/") if segment]
+    content_priority = 0 if any(segment in CONTENT_PATH_HINTS for segment in segments) else 1
+    return content_priority, len(segments), url
+
+
+def crawl_policy_reason(url: str, site: Site, *, homepage: str | None = None) -> str | None:
+    if homepage and url.rstrip("/") == homepage.rstrip("/"):
+        return None
+    if is_product_data_url(url):
+        return "产品目录或动态数据路由"
+    target = unquote(urlsplit(url).path)
+    for pattern in site.exclude_patterns or []:
+        if re.search(pattern, target, re.IGNORECASE):
+            return f"命中排除规则：{pattern}"
+    include_patterns = site.include_patterns or []
+    if include_patterns and not any(
+        re.search(pattern, target, re.IGNORECASE) for pattern in include_patterns
+    ):
+        return "不在包含规则内"
+    return None
+
+
+def should_block_page_pruning(
+    *,
+    stale_pages: int,
+    coverage: float,
+    minimum_coverage: float,
+    errors: list[str],
+) -> bool:
+    """Keep old pages whenever a partial or unhealthy crawl could erase valid data."""
+    return bool(stale_pages and (errors or coverage < minimum_coverage))
 
 
 def extract_page(html: str) -> ExtractedPage:
@@ -97,6 +306,8 @@ class CrawlerService:
     def __init__(self, settings: Settings, embedding_service: EmbeddingService):
         self.settings = settings
         self.embedding_service = embedding_service
+        self._skipped_dynamic_urls: set[str] = set()
+        self._skipped_reasons: dict[str, str] = {}
 
     async def _fetch(self, client: httpx.AsyncClient, url: str, domains: set[str]) -> httpx.Response:
         current = url
@@ -114,92 +325,183 @@ class CrawlerService:
             current = urljoin(current, location)
         raise ValueError("重定向次数过多")
 
-    async def _sitemap_urls(
-        self,
-        client: httpx.AsyncClient,
-        sitemap_url: str,
-        domains: set[str],
-        visited: set[str] | None = None,
-    ) -> list[str]:
-        visited = visited or set()
-        if sitemap_url in visited or len(visited) >= 20:
-            return []
-        visited.add(sitemap_url)
-        response = await self._fetch(client, sitemap_url, domains)
-        parser = etree.XMLParser(resolve_entities=False, no_network=True, recover=False)
-        root = etree.fromstring(response.content, parser=parser)
-        root_name = etree.QName(root.tag).localname.lower()
-        locations = [
-            clean_display_text(str(node.text or ""))
-            for node in root.xpath("//*[local-name()='loc']")
-            if node.text
-        ]
-        if root_name == "sitemapindex":
-            urls: list[str] = []
-            for child_sitemap in locations:
-                if len(urls) >= self.settings.crawler_max_pages:
-                    break
-                try:
-                    urls.extend(await self._sitemap_urls(client, child_sitemap, domains, visited))
-                except (httpx.HTTPError, etree.XMLSyntaxError, UnsafeUrlError, ValueError):
-                    continue
-            return urls[: self.settings.crawler_max_pages]
-        if root_name != "urlset":
-            raise ValueError("Sitemap 根节点必须是 urlset 或 sitemapindex")
+    def _skip(self, url: str, reason: str) -> None:
+        self._skipped_dynamic_urls.add(url)
+        self._skipped_reasons.setdefault(url, reason)
 
-        safe_urls: list[str] = []
-        for location in locations:
-            location = urldefrag(location).url
-            try:
-                await validate_target_url(location, domains)
-            except UnsafeUrlError:
-                continue
-            if location not in safe_urls:
-                safe_urls.append(location)
-            if len(safe_urls) >= self.settings.crawler_max_pages:
-                break
-        return safe_urls
+    async def _request_delay(self, site: Site) -> None:
+        if site.request_delay_ms:
+            await asyncio.sleep(site.request_delay_ms / 1000)
+
+    async def preview(self, site: Site) -> dict:
+        domains = {site.domain}
+        homepage = f"https://{site.domain}/"
+        maximum = site.crawler_max_pages or self.settings.crawler_max_pages
+        allowed_query_params = set(site.allowed_query_params or [])
+        queue: deque[str] = deque([homepage])
+        queued = {homepage}
+        visited: set[str] = set()
+        discovered: set[str] = {homepage}
+        urls_to_crawl: list[str] = []
+        errors: list[str] = []
+        self._skipped_dynamic_urls.clear()
+        self._skipped_reasons.clear()
+        timeout = httpx.Timeout(self.settings.crawler_timeout_seconds)
+        headers = {
+            "User-Agent": self.settings.crawler_user_agent,
+            "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+        }
+
+        async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
+            while queue and len(visited) < maximum:
+                url = queue.popleft()
+                queued.discard(url)
+                if url in visited:
+                    continue
+                visited.add(url)
+                try:
+                    response = await self._fetch(client, url, domains)
+                    await self._request_delay(site)
+                    content_type = response.headers.get("content-type", "").lower()
+                    if "html" not in content_type and not response.text.lstrip().lower().startswith("<!doctype html"):
+                        errors.append(f"{url}: 不是 HTML 页面")
+                        continue
+                    final_url = normalize_internal_link(
+                        str(response.url),
+                        url,
+                        domains,
+                        allowed_query_params,
+                    ) or url
+                    extracted = extract_page(response.text)
+                    if is_dynamic_product_page(
+                        final_url,
+                        extracted.title,
+                        extracted.meta_description,
+                        extracted.blocks,
+                    ):
+                        self._skip(final_url, "页面内容属于产品动态数据")
+                    elif final_url not in urls_to_crawl:
+                        urls_to_crawl.append(final_url)
+                    for link in extract_internal_links(
+                        response.text,
+                        final_url,
+                        domains,
+                        allowed_query_params,
+                    ):
+                        discovered.add(link)
+                        reason = crawl_policy_reason(link, site, homepage=homepage)
+                        if reason:
+                            self._skip(link, reason)
+                            continue
+                        if link not in visited and link not in queued:
+                            queue.append(link)
+                            queued.add(link)
+                except Exception as exc:
+                    errors.append(f"{url}: {str(exc)[:180]}")
+
+        return {
+            "site_id": site.id,
+            "pages_discovered": len(discovered),
+            "pages_to_crawl": len(urls_to_crawl),
+            "urls_to_crawl": urls_to_crawl[:500],
+            "skipped": [
+                {"url": url, "reason": reason}
+                for url, reason in list(self._skipped_reasons.items())[:500]
+            ],
+            "errors": errors[:30],
+        }
 
     async def crawl(self, session: AsyncSession, site: Site) -> dict:
         site_id = site.id
-        sitemap_url = site.sitemap_url
         domains = {site.domain}
+        maximum = site.crawler_max_pages or self.settings.crawler_max_pages
+        allowed_query_params = set(site.allowed_query_params or [])
         errors: list[str] = []
         pages_crawled = 0
         blocks_saved = 0
         timeout = httpx.Timeout(self.settings.crawler_timeout_seconds)
         headers = {"User-Agent": self.settings.crawler_user_agent, "Accept": "text/html,application/xml;q=0.9,*/*;q=0.8"}
-        stored_rows = (
-            await session.execute(
-                select(ContentBlock.page_id, ContentBlock.content_hash).where(ContentBlock.site_id == site_id)
-            )
-        ).all()
-        stored_hash_counts = Counter(content_digest for _, content_digest in stored_rows)
-        stored_hashes_by_page: dict[int, list[str]] = defaultdict(list)
-        for page_id, content_digest in stored_rows:
-            stored_hashes_by_page[page_id].append(content_digest)
-        hashes_saved_this_crawl: set[str] = set()
+        self._skipped_dynamic_urls.clear()
+        self._skipped_reasons.clear()
+        previous_pages = int(
+            (await session.scalar(select(func.count(Page.id)).where(Page.site_id == site_id))) or 0
+        )
+        crawl_run = CrawlRun(site_id=site_id, previous_pages=previous_pages, status="running")
+        session.add(crawl_run)
+        await session.commit()
+        await session.refresh(crawl_run)
 
         async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
-            page_urls = await self._sitemap_urls(client, sitemap_url, domains)
-            for url in page_urls:
+            # The homepage is the source of truth.  Following only same-domain
+            # anchors avoids footer friend links, while a bounded BFS reaches
+            # the site's real navigation without depending on sitemap.xml.
+            homepage = f"https://{site.domain}/"
+            queue: deque[str] = deque([homepage])
+            queued = {homepage}
+            visited: set[str] = set()
+            discovered: set[str] = {homepage}
+            retained_urls: set[str] = set()
+            stored_rows = (
+                await session.execute(
+                    select(ContentBlock.page_id, ContentBlock.content_hash).where(ContentBlock.site_id == site_id)
+                )
+            ).all()
+            stored_hash_counts = Counter(content_digest for _, content_digest in stored_rows)
+            stored_hashes_by_page: dict[int, list[str]] = defaultdict(list)
+            for page_id, content_digest in stored_rows:
+                stored_hashes_by_page[page_id].append(content_digest)
+            hashes_saved_this_crawl: set[str] = set()
+            while queue and len(visited) < maximum:
+                url = queue.popleft()
+                queued.discard(url)
+                if url in visited:
+                    continue
+                visited.add(url)
                 try:
                     response = await self._fetch(client, url, domains)
+                    await self._request_delay(site)
                     content_type = response.headers.get("content-type", "").lower()
                     if "html" not in content_type and not response.text.lstrip().lower().startswith("<!doctype html"):
                         errors.append(f"{url}: 不是 HTML 页面")
                         continue
+                    final_url = normalize_internal_link(
+                        str(response.url),
+                        url,
+                        domains,
+                        allowed_query_params,
+                    ) or url
+                    extracted_links = extract_internal_links(
+                        response.text,
+                        final_url,
+                        domains,
+                        allowed_query_params,
+                    )
+                    for link in extracted_links:
+                        discovered.add(link)
+                        reason = crawl_policy_reason(link, site, homepage=homepage)
+                        if reason:
+                            self._skip(link, reason)
+                            continue
+                        if link not in visited and link not in queued:
+                            queue.append(link)
+                            queued.add(link)
+                    url = final_url
+                    if url in retained_urls:
+                        continue
                     page = await session.scalar(select(Page).where(Page.site_id == site_id, Page.url == url))
                     now = datetime.now(timezone.utc)
                     page_digest = hashlib.sha256(response.content).hexdigest()
+                    extracted = extract_page(response.text)
+                    if is_dynamic_product_page(url, extracted.title, extracted.meta_description, extracted.blocks):
+                        self._skip(url, "页面内容属于产品动态数据")
+                        continue
                     if page is not None and page.content_hash == page_digest:
                         page.http_status = response.status_code
                         page.crawled_at = now
                         await session.commit()
+                        retained_urls.add(url)
                         pages_crawled += 1
                         continue
-
-                    extracted = extract_page(response.text)
                     if page is None:
                         page = Page(site_id=site_id, url=url)
                         session.add(page)
@@ -238,28 +540,58 @@ class CrawlerService:
                                 normalized_content=normalize_text(text),
                                 content_hash=block_digest,
                                 embedding=vector,
+                                embedding_version=self.embedding_service.signature,
                                 collected_at=now,
                             )
                         )
                     await session.commit()
+                    retained_urls.add(url)
                     pages_crawled += 1
                     blocks_saved += len(unique_blocks)
                 except Exception as exc:  # Keep one bad page from aborting the site crawl.
                     await session.rollback()
                     errors.append(f"{url}: {str(exc)[:180]}")
 
+        stored_pages = list((await session.scalars(select(Page).where(Page.site_id == site_id))).all())
+        stale_pages = sum(page.url not in retained_urls for page in stored_pages)
+        coverage = len(retained_urls) / previous_pages if previous_pages else 1.0
+        prune_blocked = should_block_page_pruning(
+            stale_pages=stale_pages,
+            coverage=coverage,
+            minimum_coverage=site.min_crawl_coverage,
+            errors=errors,
+        )
+        if retained_urls and not prune_blocked:
+            await remove_pages_not_retained(session, site_id, retained_urls)
         await deduplicate_site_blocks(session, site_id)
         managed_site = await session.get(Site, site_id)
         if managed_site is not None:
             managed_site.last_crawled_at = datetime.now(timezone.utc)
-            managed_site.status = "active" if pages_crawled else "error"
+            managed_site.status = "active" if pages_crawled or self._skipped_dynamic_urls else "error"
+        crawl_run = await session.get(CrawlRun, crawl_run.id)
+        if crawl_run is not None:
+            crawl_run.status = "completed_with_warnings" if errors or prune_blocked else "completed"
+            crawl_run.pages_discovered = len(discovered)
+            crawl_run.pages_crawled = pages_crawled
+            crawl_run.pages_skipped = len(self._skipped_dynamic_urls)
+            crawl_run.retained_pages = len(retained_urls)
+            crawl_run.stale_pages = stale_pages
+            crawl_run.prune_blocked = prune_blocked
+            crawl_run.errors = errors[:30]
+            crawl_run.finished_at = datetime.now(timezone.utc)
         await session.commit()
         return {
             "site_id": site_id,
-            "pages_discovered": len(page_urls),
+            "pages_discovered": len(discovered),
             "pages_crawled": pages_crawled,
+            "pages_skipped": len(self._skipped_dynamic_urls),
             "blocks_saved": blocks_saved,
             "errors": errors[:30],
+            "previous_pages": previous_pages,
+            "retained_pages": len(retained_urls),
+            "stale_pages": stale_pages,
+            "prune_blocked": prune_blocked,
+            "coverage": round(coverage, 4),
         }
 
 
@@ -284,3 +616,30 @@ async def deduplicate_site_blocks(session: AsyncSession, site_id: int) -> int:
     if duplicate_ids:
         await session.execute(delete(ContentBlock).where(ContentBlock.id.in_(duplicate_ids)))
     return len(duplicate_ids)
+
+
+async def remove_dynamic_product_pages(session: AsyncSession, site_id: int) -> int:
+    """Remove previously stored structured product pages from the copy corpus."""
+    pages = list((await session.scalars(select(Page).where(Page.site_id == site_id))).all())
+    product_page_ids = [
+        page.id
+        for page in pages
+        if is_product_data_url(page.url)
+        or is_dynamic_product_page(page.url, page.title, page.meta_description)
+    ]
+    if not product_page_ids:
+        return 0
+    await session.execute(delete(ContentBlock).where(ContentBlock.page_id.in_(product_page_ids)))
+    await session.execute(delete(Page).where(Page.id.in_(product_page_ids)))
+    return len(product_page_ids)
+
+
+async def remove_pages_not_retained(session: AsyncSession, site_id: int, retained_urls: set[str]) -> int:
+    """Drop stale pages left by older sitemap-based crawls."""
+    pages = list((await session.scalars(select(Page).where(Page.site_id == site_id))).all())
+    stale_page_ids = [page.id for page in pages if page.url not in retained_urls]
+    if not stale_page_ids:
+        return 0
+    await session.execute(delete(ContentBlock).where(ContentBlock.page_id.in_(stale_page_ids)))
+    await session.execute(delete(Page).where(Page.id.in_(stale_page_ids)))
+    return len(stale_page_ids)

@@ -12,6 +12,15 @@ class EmbeddingService:
         self._model = None
         self._model_lock = asyncio.Lock()
 
+    @property
+    def signature(self) -> str:
+        if self.settings.embedding_provider == "hashing":
+            return f"hashing:{self.settings.embedding_dimension}"
+        return (
+            f"{self.settings.embedding_provider}:"
+            f"{self.settings.embedding_model}:{self.settings.embedding_dimension}"
+        )
+
     async def _get_fastembed_model(self):
         if self._model is not None:
             return self._model

@@ -32,6 +32,43 @@ async def initialize_database() -> None:
 
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
+        site_columns = {
+            row[1] for row in (await connection.execute(text("PRAGMA table_info(sites)"))).all()
+        }
+        if "site_type" not in site_columns:
+            await connection.execute(
+                text("ALTER TABLE sites ADD COLUMN site_type VARCHAR(32) NOT NULL DEFAULT 'baseline'")
+            )
+        await connection.execute(text("CREATE INDEX IF NOT EXISTS ix_sites_site_type ON sites (site_type)"))
+        policy_columns = {
+            "include_patterns": "JSON NOT NULL DEFAULT '[]'",
+            "exclude_patterns": "JSON NOT NULL DEFAULT '[]'",
+            "allowed_query_params": "JSON NOT NULL DEFAULT '[]'",
+            "crawler_max_pages": "INTEGER",
+            "request_delay_ms": "INTEGER NOT NULL DEFAULT 0",
+            "min_crawl_coverage": "FLOAT NOT NULL DEFAULT 0.7",
+        }
+        for column_name, column_type in policy_columns.items():
+            if column_name not in site_columns:
+                await connection.execute(
+                    text(f"ALTER TABLE sites ADD COLUMN {column_name} {column_type}")
+                )
+        block_columns = {
+            row[1] for row in (await connection.execute(text("PRAGMA table_info(content_blocks)"))).all()
+        }
+        if "embedding_version" not in block_columns:
+            await connection.execute(
+                text(
+                    "ALTER TABLE content_blocks ADD COLUMN embedding_version "
+                    "VARCHAR(255) NOT NULL DEFAULT 'hashing:512'"
+                )
+            )
+        await connection.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_content_blocks_embedding_version "
+                "ON content_blocks (embedding_version)"
+            )
+        )
         # Older local databases predate site-wide deduplication. Clean them
         # before adding the invariant so existing installations self-repair.
         await connection.execute(
@@ -52,6 +89,24 @@ async def initialize_database() -> None:
 
 async def close_database() -> None:
     await engine.dispose()
+
+
+async def recover_interrupted_jobs() -> None:
+    """Ensure a process restart cannot leave jobs permanently marked as running."""
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                "UPDATE background_jobs SET status = 'error', progress = 0, "
+                "error = '服务重启，任务已中断，请重新执行', finished_at = CURRENT_TIMESTAMP "
+                "WHERE status IN ('queued', 'running')"
+            )
+        )
+        await connection.execute(
+            text(
+                "UPDATE crawl_runs SET status = 'error', finished_at = CURRENT_TIMESTAMP "
+                "WHERE status = 'running'"
+            )
+        )
 
 
 async def get_session() -> AsyncGenerator[AsyncSession, None]:

@@ -63,10 +63,9 @@ const statCards = computed(() => [
       <p>真实数据进入数据库，检测结果可直接追溯到原始页面。</p>
     </div>
     <div class="workflow-grid">
-      <article><span class="step-number">01</span><h3>接入网站</h3><p>登记域名与 Sitemap，系统验证目标后开始采集。</p><NuxtLink to="/sites">管理网站 →</NuxtLink></article>
+      <article><span class="step-number">01</span><h3>接入网站</h3><p>登记网站域名，系统会从首页自动发现站内页面。</p><NuxtLink to="/sites">管理网站 →</NuxtLink></article>
       <article><span class="step-number">02</span><h3>沉淀文案</h3><p>过滤导航页脚，按标题和正文段落拆分并向量化。</p><NuxtLink to="/library">浏览文案库 →</NuxtLink></article>
       <article class="featured"><span class="step-number">03</span><h3>上线前检测</h3><p>粘贴新文案，查看 Top 10 风险片段、评分和来源。</p><NuxtLink to="/checker">立即检测 →</NuxtLink></article>
     </div>
   </section>
 </template>
-

@@ -3,11 +3,19 @@ export interface Site {
   name: string
   domain: string
   sitemap_url: string
+  site_type: 'baseline' | 'candidate'
+  include_patterns: string[]
+  exclude_patterns: string[]
+  allowed_query_params: string[]
+  crawler_max_pages: number | null
+  request_delay_ms: number
+  min_crawl_coverage: number
   status: 'active' | 'paused' | 'error'
   last_crawled_at: string | null
   created_at: string
   page_count: number
   block_count: number
+  outdated_block_count: number
 }
 
 export interface Stats {
@@ -21,8 +29,87 @@ export interface CrawlSummary {
   site_id: number
   pages_discovered: number
   pages_crawled: number
+  pages_skipped: number
   blocks_saved: number
   errors: string[]
+  previous_pages: number
+  retained_pages: number
+  stale_pages: number
+  prune_blocked: boolean
+  coverage: number
+}
+
+export interface CrawlPreviewSkipped {
+  url: string
+  reason: string
+}
+
+export interface CrawlPreview {
+  site_id: number
+  pages_discovered: number
+  pages_to_crawl: number
+  urls_to_crawl: string[]
+  skipped: CrawlPreviewSkipped[]
+  errors: string[]
+}
+
+export interface CrawlRun {
+  id: number
+  site_id: number
+  status: 'running' | 'completed' | 'completed_with_warnings' | 'error'
+  pages_discovered: number
+  pages_crawled: number
+  pages_skipped: number
+  previous_pages: number
+  retained_pages: number
+  stale_pages: number
+  prune_blocked: boolean
+  errors: string[]
+  started_at: string
+  finished_at: string | null
+}
+
+export interface BackgroundJob<T = Record<string, unknown>> {
+  id: number
+  site_id: number
+  job_type: 'crawl' | 'preview' | 'audit' | 'reindex'
+  status: 'queued' | 'running' | 'completed' | 'error'
+  progress: number
+  result: T | null
+  error: string | null
+  created_at: string
+  started_at: string | null
+  finished_at: string | null
+}
+
+export interface ReindexResult {
+  site_id: number
+  site_name: string
+  blocks_reindexed: number
+  embedding_version: string
+}
+
+export interface SiteAuditFinding {
+  candidate_block_id: number
+  candidate_content: string
+  candidate_content_type: string
+  candidate_page_title: string | null
+  candidate_url: string
+  top_score: number
+  risk_level: 'high' | 'medium' | 'low'
+  matches: SimilarityResult[]
+}
+
+export interface SiteAuditReport {
+  site_id: number
+  site_name: string
+  total_blocks: number
+  matched_blocks: number
+  high_risk_blocks: number
+  medium_risk_blocks: number
+  low_risk_blocks: number
+  max_similarity: number
+  findings: SiteAuditFinding[]
 }
 
 export interface ContentBlock {
@@ -73,4 +160,3 @@ export interface SimilarityResponse {
   threshold: number
   results: SimilarityResult[]
 }
-

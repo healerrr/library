@@ -1,10 +1,12 @@
 from datetime import datetime
+import re
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 VALID_SITE_STATUSES = {"active", "paused", "error"}
+VALID_SITE_TYPES = {"baseline", "candidate"}
 
 
 def normalize_domain(value: str) -> str:
@@ -18,8 +20,15 @@ def normalize_domain(value: str) -> str:
 class SiteCreate(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     domain: str = Field(min_length=3, max_length=255)
-    sitemap_url: str = Field(min_length=10, max_length=2048)
+    sitemap_url: str = Field(default="", max_length=2048)
     status: str = "active"
+    site_type: str = "baseline"
+    include_patterns: list[str] = Field(default_factory=list, max_length=50)
+    exclude_patterns: list[str] = Field(default_factory=list, max_length=50)
+    allowed_query_params: list[str] = Field(default_factory=list, max_length=30)
+    crawler_max_pages: int | None = Field(default=None, ge=1, le=5000)
+    request_delay_ms: int = Field(default=0, ge=0, le=5000)
+    min_crawl_coverage: float = Field(default=0.7, ge=0.1, le=1.0)
 
     @field_validator("name", "sitemap_url", mode="before")
     @classmethod
@@ -34,6 +43,8 @@ class SiteCreate(BaseModel):
     @field_validator("sitemap_url")
     @classmethod
     def sitemap_must_be_http(cls, value: str) -> str:
+        if not value:
+            return value
         parsed = urlparse(value)
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
             raise ValueError("Sitemap 必须是有效的 HTTP(S) 地址")
@@ -48,11 +59,55 @@ class SiteCreate(BaseModel):
             raise ValueError("无效的网站状态")
         return value
 
+    @field_validator("site_type")
+    @classmethod
+    def valid_site_type(cls, value: str) -> str:
+        if value not in VALID_SITE_TYPES:
+            raise ValueError("无效的网站类型")
+        return value
+
+    @field_validator("include_patterns", "exclude_patterns")
+    @classmethod
+    def valid_route_patterns(cls, values: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        for value in values:
+            pattern = value.strip()
+            if not pattern:
+                continue
+            if len(pattern) > 300:
+                raise ValueError("单条路由规则不能超过300个字符")
+            try:
+                re.compile(pattern)
+            except re.error as exc:
+                raise ValueError(f"无效的路由正则：{pattern}") from exc
+            if pattern not in cleaned:
+                cleaned.append(pattern)
+        return cleaned
+
+    @field_validator("allowed_query_params")
+    @classmethod
+    def valid_query_params(cls, values: list[str]) -> list[str]:
+        cleaned = []
+        for value in values:
+            name = value.strip()
+            if name and not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", name):
+                raise ValueError(f"无效的查询参数名：{name}")
+            if name and name not in cleaned:
+                cleaned.append(name)
+        return cleaned
+
 
 class SiteUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=200)
     sitemap_url: str | None = Field(default=None, min_length=10, max_length=2048)
     status: str | None = None
+    site_type: str | None = None
+    include_patterns: list[str] | None = Field(default=None, max_length=50)
+    exclude_patterns: list[str] | None = Field(default=None, max_length=50)
+    allowed_query_params: list[str] | None = Field(default=None, max_length=30)
+    crawler_max_pages: int | None = Field(default=None, ge=1, le=5000)
+    request_delay_ms: int | None = Field(default=None, ge=0, le=5000)
+    min_crawl_coverage: float | None = Field(default=None, ge=0.1, le=1.0)
 
     @field_validator("status")
     @classmethod
@@ -60,6 +115,27 @@ class SiteUpdate(BaseModel):
         if value is not None and value not in VALID_SITE_STATUSES:
             raise ValueError("无效的网站状态")
         return value
+
+    @field_validator("site_type")
+    @classmethod
+    def valid_site_type(cls, value: str | None) -> str | None:
+        if value is not None and value not in VALID_SITE_TYPES:
+            raise ValueError("无效的网站类型")
+        return value
+
+    @field_validator("include_patterns", "exclude_patterns")
+    @classmethod
+    def valid_route_patterns(cls, values: list[str] | None) -> list[str] | None:
+        if values is None:
+            return None
+        return SiteCreate.valid_route_patterns(values)
+
+    @field_validator("allowed_query_params")
+    @classmethod
+    def valid_query_params(cls, values: list[str] | None) -> list[str] | None:
+        if values is None:
+            return None
+        return SiteCreate.valid_query_params(values)
 
 
 class SiteOut(BaseModel):
@@ -69,19 +145,75 @@ class SiteOut(BaseModel):
     name: str
     domain: str
     sitemap_url: str
+    site_type: str
+    include_patterns: list[str]
+    exclude_patterns: list[str]
+    allowed_query_params: list[str]
+    crawler_max_pages: int | None
+    request_delay_ms: int
+    min_crawl_coverage: float
     status: str
     last_crawled_at: datetime | None
     created_at: datetime
     page_count: int = 0
     block_count: int = 0
+    outdated_block_count: int = 0
 
 
 class CrawlSummary(BaseModel):
     site_id: int
     pages_discovered: int
     pages_crawled: int
+    pages_skipped: int = 0
     blocks_saved: int
     errors: list[str]
+    previous_pages: int = 0
+    retained_pages: int = 0
+    stale_pages: int = 0
+    prune_blocked: bool = False
+    coverage: float = 1.0
+
+
+class CrawlPreview(BaseModel):
+    site_id: int
+    pages_discovered: int
+    pages_to_crawl: int
+    urls_to_crawl: list[str]
+    skipped: list[dict]
+    errors: list[str]
+
+
+class CrawlRunOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    site_id: int
+    status: str
+    pages_discovered: int
+    pages_crawled: int
+    pages_skipped: int
+    previous_pages: int
+    retained_pages: int
+    stale_pages: int
+    prune_blocked: bool
+    errors: list[str]
+    started_at: datetime
+    finished_at: datetime | None
+
+
+class BackgroundJobOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    site_id: int
+    job_type: str
+    status: str
+    progress: int
+    result: dict | None
+    error: str | None
+    created_at: datetime
+    started_at: datetime | None
+    finished_at: datetime | None
 
 
 class ContentBlockOut(BaseModel):
@@ -148,4 +280,3 @@ class StatsOut(BaseModel):
     pages: int
     content_blocks: int
     similarity_checks: int
-

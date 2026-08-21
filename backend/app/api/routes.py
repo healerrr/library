@@ -1,19 +1,22 @@
 import math
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Response, status
 from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings, get_settings
-from app.database import get_session
-from app.models import ContentBlock, Page, SimilarityCheck, Site
+from app.database import SessionLocal, get_session
+from app.models import BackgroundJob, ContentBlock, CrawlRun, Page, SimilarityCheck, Site
 from app.schemas import (
+    BackgroundJobOut,
     ContentBlockOut,
     ContentBlockPage,
     CrawlSummary,
+    CrawlRunOut,
     SimilarityCheckRequest,
     SimilarityCheckResponse,
     SiteCreate,
@@ -24,6 +27,8 @@ from app.schemas import (
 from app.services.crawler import CrawlerService
 from app.services.embeddings import get_embedding_service
 from app.services.similarity import SimilarityService
+from app.services.site_audit import SiteAuditService
+from app.services.reindex import ReindexService
 from app.services.ssrf import UnsafeUrlError, validate_url_format
 
 
@@ -35,24 +40,205 @@ def is_unique_violation(exc: IntegrityError) -> bool:
     return getattr(original, "sqlstate", None) == "23505" or "unique constraint" in str(original).lower()
 
 
-def site_dict(site: Site, page_count: int = 0, block_count: int = 0) -> dict:
+def site_dict(
+    site: Site,
+    page_count: int = 0,
+    block_count: int = 0,
+    outdated_block_count: int = 0,
+) -> dict:
     return {
         "id": site.id,
         "name": site.name,
         "domain": site.domain,
         "sitemap_url": site.sitemap_url,
+        "site_type": site.site_type,
+        "include_patterns": site.include_patterns or [],
+        "exclude_patterns": site.exclude_patterns or [],
+        "allowed_query_params": site.allowed_query_params or [],
+        "crawler_max_pages": site.crawler_max_pages,
+        "request_delay_ms": site.request_delay_ms,
+        "min_crawl_coverage": site.min_crawl_coverage,
         "status": site.status,
         "last_crawled_at": site.last_crawled_at,
         "created_at": site.created_at,
         "page_count": page_count,
         "block_count": block_count,
+        "outdated_block_count": outdated_block_count,
     }
+
+
+async def mark_job_failed(job_id: int, message: str) -> None:
+    async with SessionLocal() as session:
+        job = await session.get(BackgroundJob, job_id)
+        if job is not None:
+            job.status = "error"
+            job.error = message[:1000]
+            job.finished_at = datetime.now(timezone.utc)
+            await session.commit()
+
+
+async def mark_crawl_run_failed(site_id: int, message: str) -> None:
+    async with SessionLocal() as session:
+        crawl_run = await session.scalar(
+            select(CrawlRun)
+            .where(CrawlRun.site_id == site_id, CrawlRun.status == "running")
+            .order_by(CrawlRun.id.desc())
+            .limit(1)
+        )
+        if crawl_run is not None:
+            crawl_run.status = "error"
+            crawl_run.errors = [message[:300]]
+            crawl_run.finished_at = datetime.now(timezone.utc)
+            await session.commit()
+
+
+async def run_crawl_job(job_id: int, site_id: int, settings: Settings) -> None:
+    try:
+        async with SessionLocal() as session:
+            job = await session.get(BackgroundJob, job_id)
+            site = await session.get(Site, site_id)
+            if job is None or site is None:
+                raise ValueError("任务或网站不存在")
+            job.status = "running"
+            job.progress = 5
+            job.started_at = datetime.now(timezone.utc)
+            await session.commit()
+            result = await CrawlerService(settings, get_embedding_service()).crawl(session, site)
+            job = await session.get(BackgroundJob, job_id)
+            if job is not None:
+                job.status = "completed"
+                job.progress = 100
+                job.result = result
+                job.finished_at = datetime.now(timezone.utc)
+                await session.commit()
+    except Exception as exc:
+        await mark_job_failed(job_id, str(exc))
+        await mark_crawl_run_failed(site_id, str(exc))
+
+
+async def run_preview_job(job_id: int, site_id: int, settings: Settings) -> None:
+    try:
+        async with SessionLocal() as session:
+            job = await session.get(BackgroundJob, job_id)
+            site = await session.get(Site, site_id)
+            if job is None or site is None:
+                raise ValueError("任务或网站不存在")
+            job.status = "running"
+            job.progress = 5
+            job.started_at = datetime.now(timezone.utc)
+            await session.commit()
+            result = await CrawlerService(settings, get_embedding_service()).preview(site)
+            job = await session.get(BackgroundJob, job_id)
+            if job is not None:
+                job.status = "completed"
+                job.progress = 100
+                job.result = result
+                job.finished_at = datetime.now(timezone.utc)
+                await session.commit()
+    except Exception as exc:
+        await mark_job_failed(job_id, str(exc))
+
+
+async def run_audit_job(job_id: int, site_id: int, settings: Settings) -> None:
+    try:
+        async with SessionLocal() as session:
+            job = await session.get(BackgroundJob, job_id)
+            site = await session.get(Site, site_id)
+            if job is None or site is None:
+                raise ValueError("任务或网站不存在")
+            job.status = "running"
+            job.progress = 1
+            job.started_at = datetime.now(timezone.utc)
+            await session.commit()
+
+            async def update_progress(value: int) -> None:
+                managed_job = await session.get(BackgroundJob, job_id)
+                if managed_job is not None:
+                    managed_job.progress = value
+                    await session.commit()
+
+            result = await SiteAuditService(settings, get_embedding_service()).audit(
+                session,
+                site,
+                update_progress,
+            )
+            job = await session.get(BackgroundJob, job_id)
+            if job is not None:
+                job.status = "completed"
+                job.progress = 100
+                job.result = result
+                job.finished_at = datetime.now(timezone.utc)
+                await session.commit()
+    except Exception as exc:
+        await mark_job_failed(job_id, str(exc))
+
+
+async def run_reindex_job(job_id: int, site_id: int) -> None:
+    try:
+        async with SessionLocal() as session:
+            job = await session.get(BackgroundJob, job_id)
+            site = await session.get(Site, site_id)
+            if job is None or site is None:
+                raise ValueError("任务或网站不存在")
+            job.status = "running"
+            job.progress = 1
+            job.started_at = datetime.now(timezone.utc)
+            await session.commit()
+
+            async def update_progress(value: int) -> None:
+                managed_job = await session.get(BackgroundJob, job_id)
+                if managed_job is not None:
+                    managed_job.progress = value
+                    await session.commit()
+
+            result = await ReindexService(get_embedding_service()).reindex_site(
+                session,
+                site,
+                update_progress,
+            )
+            job = await session.get(BackgroundJob, job_id)
+            if job is not None:
+                job.status = "completed"
+                job.progress = 100
+                job.result = result
+                job.finished_at = datetime.now(timezone.utc)
+                await session.commit()
+    except Exception as exc:
+        await mark_job_failed(job_id, str(exc))
+
+
+async def create_background_job(
+    session: AsyncSession,
+    site_id: int,
+    job_type: str,
+) -> tuple[BackgroundJob, bool]:
+    active = await session.scalar(
+        select(BackgroundJob)
+        .where(
+            BackgroundJob.site_id == site_id,
+            BackgroundJob.job_type == job_type,
+            BackgroundJob.status.in_({"queued", "running"}),
+        )
+        .order_by(BackgroundJob.id.desc())
+    )
+    if active is not None:
+        return active, False
+    job = BackgroundJob(site_id=site_id, job_type=job_type, status="queued", progress=0)
+    session.add(job)
+    await session.commit()
+    await session.refresh(job)
+    return job, True
 
 
 @router.get("/health")
 async def health(session: AsyncSession = Depends(get_session), settings: Settings = Depends(get_settings)):
     await session.execute(select(1))
-    return {"status": "ok", "embedding_provider": settings.embedding_provider}
+    return {
+        "status": "ok",
+        "embedding_provider": settings.embedding_provider,
+        "embedding_version": get_embedding_service().signature,
+        "vector_database": session.get_bind().dialect.name,
+    }
 
 
 @router.get("/stats", response_model=StatsOut)
@@ -69,16 +255,33 @@ async def list_sites(session: AsyncSession = Depends(get_session)):
     block_count = (
         select(func.count(ContentBlock.id)).where(ContentBlock.site_id == Site.id).correlate(Site).scalar_subquery()
     )
-    rows = (await session.execute(select(Site, page_count, block_count).order_by(Site.created_at.desc()))).all()
-    return [site_dict(site, int(pages), int(blocks)) for site, pages, blocks in rows]
+    outdated_count = (
+        select(func.count(ContentBlock.id))
+        .where(
+            ContentBlock.site_id == Site.id,
+            ContentBlock.embedding_version != get_embedding_service().signature,
+        )
+        .correlate(Site)
+        .scalar_subquery()
+    )
+    rows = (
+        await session.execute(
+            select(Site, page_count, block_count, outdated_count).order_by(Site.created_at.desc())
+        )
+    ).all()
+    return [
+        site_dict(site, int(pages), int(blocks), int(outdated))
+        for site, pages, blocks, outdated in rows
+    ]
 
 
 @router.post("/sites", response_model=SiteOut, status_code=status.HTTP_201_CREATED)
 async def create_site(payload: SiteCreate, session: AsyncSession = Depends(get_session)):
-    try:
-        validate_url_format(payload.sitemap_url, {payload.domain})
-    except UnsafeUrlError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if payload.sitemap_url:
+        try:
+            validate_url_format(payload.sitemap_url, {payload.domain})
+        except UnsafeUrlError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     site = Site(**payload.model_dump())
     session.add(site)
@@ -144,6 +347,127 @@ async def crawl_site(
             managed_site.status = "error"
             await session.commit()
         raise HTTPException(status_code=400, detail=f"采集失败：{str(exc)[:300]}") from exc
+
+
+@router.post(
+    "/sites/{site_id}/crawl-jobs",
+    response_model=BackgroundJobOut,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def create_crawl_job(
+    site_id: int,
+    background_tasks: BackgroundTasks,
+    session: AsyncSession = Depends(get_session),
+    settings: Settings = Depends(get_settings),
+):
+    site = await session.get(Site, site_id)
+    if site is None:
+        raise HTTPException(status_code=404, detail="网站不存在")
+    if site.status == "paused":
+        raise HTTPException(status_code=409, detail="网站已暂停，请先启用")
+    job, created = await create_background_job(session, site_id, "crawl")
+    if created:
+        background_tasks.add_task(run_crawl_job, job.id, site_id, settings)
+    return job
+
+
+@router.post(
+    "/sites/{site_id}/preview-jobs",
+    response_model=BackgroundJobOut,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def create_preview_job(
+    site_id: int,
+    background_tasks: BackgroundTasks,
+    session: AsyncSession = Depends(get_session),
+    settings: Settings = Depends(get_settings),
+):
+    site = await session.get(Site, site_id)
+    if site is None:
+        raise HTTPException(status_code=404, detail="网站不存在")
+    job, created = await create_background_job(session, site_id, "preview")
+    if created:
+        background_tasks.add_task(run_preview_job, job.id, site_id, settings)
+    return job
+
+
+@router.post(
+    "/sites/{site_id}/audit-jobs",
+    response_model=BackgroundJobOut,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def create_audit_job(
+    site_id: int,
+    background_tasks: BackgroundTasks,
+    session: AsyncSession = Depends(get_session),
+    settings: Settings = Depends(get_settings),
+):
+    site = await session.get(Site, site_id)
+    if site is None:
+        raise HTTPException(status_code=404, detail="网站不存在")
+    if site.site_type != "candidate":
+        raise HTTPException(status_code=409, detail="只有待上线站点可以执行整站检测")
+    block_count = int(
+        (await session.scalar(select(func.count(ContentBlock.id)).where(ContentBlock.site_id == site_id))) or 0
+    )
+    if not block_count:
+        raise HTTPException(status_code=409, detail="该站点还没有文案，请先执行采集")
+    job, created = await create_background_job(session, site_id, "audit")
+    if created:
+        background_tasks.add_task(run_audit_job, job.id, site_id, settings)
+    return job
+
+
+@router.get("/jobs/{job_id}", response_model=BackgroundJobOut)
+async def get_background_job(job_id: int, session: AsyncSession = Depends(get_session)):
+    job = await session.get(BackgroundJob, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return job
+
+
+@router.get("/sites/{site_id}/crawl-runs", response_model=list[CrawlRunOut])
+async def list_crawl_runs(
+    site_id: int,
+    limit: int = Query(default=10, ge=1, le=50),
+    session: AsyncSession = Depends(get_session),
+):
+    if await session.get(Site, site_id) is None:
+        raise HTTPException(status_code=404, detail="网站不存在")
+    return list(
+        (
+            await session.scalars(
+                select(CrawlRun)
+                .where(CrawlRun.site_id == site_id)
+                .order_by(CrawlRun.id.desc())
+                .limit(limit)
+            )
+        ).all()
+    )
+
+
+@router.post(
+    "/sites/{site_id}/reindex-jobs",
+    response_model=BackgroundJobOut,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def create_reindex_job(
+    site_id: int,
+    background_tasks: BackgroundTasks,
+    session: AsyncSession = Depends(get_session),
+):
+    site = await session.get(Site, site_id)
+    if site is None:
+        raise HTTPException(status_code=404, detail="网站不存在")
+    block_count = int(
+        (await session.scalar(select(func.count(ContentBlock.id)).where(ContentBlock.site_id == site_id))) or 0
+    )
+    if not block_count:
+        raise HTTPException(status_code=409, detail="该站点还没有文案")
+    job, created = await create_background_job(session, site_id, "reindex")
+    if created:
+        background_tasks.add_task(run_reindex_job, job.id, site_id)
+    return job
 
 
 @router.get("/content-blocks", response_model=ContentBlockPage)
