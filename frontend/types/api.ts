@@ -3,6 +3,7 @@ export interface Site {
   name: string
   domain: string
   sitemap_url: string
+  site_scheme: 'http' | 'https'
   site_type: 'baseline' | 'candidate'
   include_patterns: string[]
   exclude_patterns: string[]

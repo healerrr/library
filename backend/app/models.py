@@ -31,6 +31,7 @@ class Site(Base):
     name: Mapped[str] = mapped_column(String(200))
     domain: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     sitemap_url: Mapped[str] = mapped_column(String(2048))
+    site_scheme: Mapped[str] = mapped_column(String(8), default="https", server_default="https")
     site_type: Mapped[str] = mapped_column(String(32), default="baseline", server_default="baseline", index=True)
     include_patterns: Mapped[list[str]] = mapped_column(JSON, default=list)
     exclude_patterns: Mapped[list[str]] = mapped_column(JSON, default=list)

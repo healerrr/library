@@ -15,10 +15,25 @@ def canonical_domain(value: str) -> str:
     return value.encode("idna").decode("ascii")
 
 
-def hostname_allowed(hostname: str, allowed_domains: set[str]) -> bool:
+def domain_endpoint(value: str, scheme: str) -> tuple[str, int]:
+    parsed = urlparse(f"//{value}")
+    if not parsed.hostname:
+        raise UnsafeUrlError("网站域名配置无效")
+    port = parsed.port or (443 if scheme == "https" else 80)
+    return canonical_domain(parsed.hostname), port
+
+
+def hostname_allowed(
+    hostname: str,
+    port: int,
+    scheme: str,
+    allowed_domains: set[str],
+) -> bool:
     host = canonical_domain(hostname)
     for domain in allowed_domains:
-        candidate = canonical_domain(domain)
+        candidate, candidate_port = domain_endpoint(domain, scheme)
+        if port != candidate_port:
+            continue
         if host == candidate or host.endswith(f".{candidate}"):
             return True
     return False
@@ -42,11 +57,9 @@ def validate_url_format(url: str, allowed_domains: set[str]) -> tuple[str, int]:
         raise UnsafeUrlError("只允许 HTTP 或 HTTPS 地址")
     if not parsed.hostname or parsed.username or parsed.password:
         raise UnsafeUrlError("URL 格式无效或包含认证信息")
-    if not hostname_allowed(parsed.hostname, allowed_domains):
-        raise UnsafeUrlError("采集器只能访问已添加网站的域名")
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
-    if port not in {80, 443}:
-        raise UnsafeUrlError("采集器只允许访问 80/443 端口")
+    if not hostname_allowed(parsed.hostname, port, parsed.scheme, allowed_domains):
+        raise UnsafeUrlError("采集器只能访问已配置的域名和端口")
     return parsed.hostname, port
 
 
@@ -66,4 +79,3 @@ async def validate_target_url(url: str, allowed_domains: set[str]) -> None:
     resolved = {address[4][0] for address in addresses}
     if not resolved or any(not ip_is_public(address) for address in resolved):
         raise UnsafeUrlError("禁止访问 localhost、内网或保留 IP 地址")
-

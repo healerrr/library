@@ -14,13 +14,20 @@ def normalize_domain(value: str) -> str:
     parsed = urlparse(candidate if "://" in candidate else f"https://{candidate}")
     if not parsed.hostname:
         raise ValueError("请输入有效域名")
-    return parsed.hostname.encode("idna").decode("ascii").rstrip(".")
+    if parsed.username or parsed.password:
+        raise ValueError("域名不能包含认证信息")
+    domain = parsed.hostname.encode("idna").decode("ascii").rstrip(".")
+    default_port = 443 if parsed.scheme == "https" else 80
+    if parsed.port and parsed.port != default_port:
+        domain = f"{domain}:{parsed.port}"
+    return domain
 
 
 class SiteCreate(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     domain: str = Field(min_length=3, max_length=255)
     sitemap_url: str = Field(default="", max_length=2048)
+    site_scheme: str = Field(default="https", pattern=r"^(http|https)$")
     status: str = "active"
     site_type: str = "baseline"
     include_patterns: list[str] = Field(default_factory=list, max_length=50)
@@ -66,9 +73,11 @@ class SiteCreate(BaseModel):
             raise ValueError("无效的网站类型")
         return value
 
-    @field_validator("include_patterns", "exclude_patterns")
+    @field_validator("include_patterns", "exclude_patterns", mode="before")
     @classmethod
-    def valid_route_patterns(cls, values: list[str]) -> list[str]:
+    def valid_route_patterns(cls, values: list[str] | str) -> list[str]:
+        if isinstance(values, str):
+            values = values.splitlines()
         cleaned: list[str] = []
         for value in values:
             pattern = value.strip()
@@ -100,6 +109,7 @@ class SiteCreate(BaseModel):
 class SiteUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=200)
     sitemap_url: str | None = Field(default=None, min_length=10, max_length=2048)
+    site_scheme: str | None = Field(default=None, pattern=r"^(http|https)$")
     status: str | None = None
     site_type: str | None = None
     include_patterns: list[str] | None = Field(default=None, max_length=50)
@@ -123,11 +133,13 @@ class SiteUpdate(BaseModel):
             raise ValueError("无效的网站类型")
         return value
 
-    @field_validator("include_patterns", "exclude_patterns")
+    @field_validator("include_patterns", "exclude_patterns", mode="before")
     @classmethod
-    def valid_route_patterns(cls, values: list[str] | None) -> list[str] | None:
+    def valid_route_patterns(cls, values: list[str] | str | None) -> list[str] | None:
         if values is None:
             return None
+        if isinstance(values, str):
+            values = values.splitlines()
         return SiteCreate.valid_route_patterns(values)
 
     @field_validator("allowed_query_params")
@@ -145,6 +157,7 @@ class SiteOut(BaseModel):
     name: str
     domain: str
     sitemap_url: str
+    site_scheme: str
     site_type: str
     include_patterns: list[str]
     exclude_patterns: list[str]

@@ -20,8 +20,9 @@ const editingStrategyId = ref<number | null>(null)
 const strategySaving = ref(false)
 const message = ref<{ type: 'success' | 'error'; text: string } | null>(null)
 const showForm = ref(false)
-const form = reactive({ name: '', domain: '', site_type: 'baseline', status: 'active' })
+const form = reactive({ name: '', domain: '', site_scheme: 'https', site_type: 'baseline', status: 'active' })
 const strategyForm = reactive({
+  siteScheme: 'https',
   includePatterns: '',
   excludePatterns: '',
   allowedQueryParams: '',
@@ -29,6 +30,10 @@ const strategyForm = reactive({
   requestDelayMs: 0,
   minCoveragePercent: 70,
 })
+const showStrategyModal = ref(false)
+const showPreviewModal = ref(false)
+const showAuditModal = ref(false)
+const showRunsModal = ref(false)
 const busy = computed(() => crawlingId.value !== null || previewingId.value !== null || auditingId.value !== null || reindexingId.value !== null)
 
 async function loadSites() {
@@ -51,7 +56,7 @@ async function createSite() {
   saving.value = true
   try {
     await api<Site>('/sites', { method: 'POST', body: form })
-    Object.assign(form, { name: '', domain: '', site_type: 'baseline', status: 'active' })
+    Object.assign(form, { name: '', domain: '', site_scheme: 'https', site_type: 'baseline', status: 'active' })
     showForm.value = false
     notify('success', '网站已添加，可以开始采集')
     await loadSites()
@@ -97,6 +102,7 @@ async function preview(site: Site) {
     const job = await waitForJob(initial)
     if (!job.result) throw new Error('预览任务没有返回结果')
     previewResult.value = job.result
+    showPreviewModal.value = true
     notify('success', `预览完成：发现 ${job.result.pages_discovered} 个链接，其中 ${job.result.pages_to_crawl} 个页面将被采集`)
   } catch (err) {
     notify('error', err)
@@ -127,6 +133,7 @@ async function audit(site: Site) {
     const job = await waitForJob(initial)
     if (!job.result) throw new Error('检测任务没有返回报告')
     auditReport.value = job.result
+    showAuditModal.value = true
     notify('success', `整站检测完成：${job.result.matched_blocks} 条文案达到风险阈值`)
   } catch (err) {
     notify('error', err)
@@ -165,6 +172,7 @@ function splitQueryParams(value: string) {
 function openStrategy(site: Site) {
   editingStrategyId.value = site.id
   Object.assign(strategyForm, {
+    siteScheme: site.site_scheme,
     includePatterns: site.include_patterns.join('\n'),
     excludePatterns: site.exclude_patterns.join('\n'),
     allowedQueryParams: site.allowed_query_params.join(', '),
@@ -172,6 +180,7 @@ function openStrategy(site: Site) {
     requestDelayMs: site.request_delay_ms,
     minCoveragePercent: Math.round(site.min_crawl_coverage * 100),
   })
+  showStrategyModal.value = true
 }
 
 async function saveStrategy() {
@@ -182,6 +191,7 @@ async function saveStrategy() {
     await api<Site>(`/sites/${editingStrategyId.value}`, {
       method: 'PATCH',
       body: {
+        site_scheme: strategyForm.siteScheme,
         include_patterns: splitRuleLines(strategyForm.includePatterns),
         exclude_patterns: splitRuleLines(strategyForm.excludePatterns),
         allowed_query_params: splitQueryParams(strategyForm.allowedQueryParams),
@@ -191,6 +201,7 @@ async function saveStrategy() {
       },
     })
     notify('success', '采集策略已保存，建议先执行采集预览再正式采集')
+    showStrategyModal.value = false
     editingStrategyId.value = null
     await loadSites()
   } catch (err) {
@@ -205,6 +216,7 @@ async function showCrawlRuns(site: Site) {
   crawlRunSiteName.value = site.name
   try {
     crawlRuns.value = await api<CrawlRun[]>(`/sites/${site.id}/crawl-runs?limit=10`)
+    showRunsModal.value = true
   } catch (err) {
     notify('error', err)
   } finally {
@@ -253,6 +265,7 @@ onMounted(loadSites)
         <div class="form-grid">
           <label><span>网站名称</span><input v-model="form.name" required maxlength="200" placeholder="例如：中文官网"></label>
           <label><span>域名</span><input v-model="form.domain" required placeholder="example.com"></label>
+          <label><span>协议</span><select v-model="form.site_scheme"><option value="https">HTTPS</option><option value="http">HTTP</option></select></label>
           <label><span>用途</span><select v-model="form.site_type"><option value="baseline">历史基准站点</option><option value="candidate">待上线检测站点</option></select></label>
           <label><span>状态</span><select v-model="form.status"><option value="active">启用</option><option value="paused">暂停</option></select></label>
         </div>
@@ -268,7 +281,7 @@ onMounted(loadSites)
       <div v-else-if="!sites.length" class="empty-state"><span class="empty-icon">站</span><h3>还没有接入网站</h3><p>添加第一个网站并执行采集，文案会出现在文案库。</p><button class="button primary" @click="showForm = true">添加网站</button></div>
       <div v-else class="site-list">
         <article v-for="site in sites" :key="site.id" class="site-row">
-          <div class="site-identity"><span class="site-avatar">{{ site.name.slice(0, 1) }}</span><div><h3>{{ site.name }} <small :class="['site-type', site.site_type]">{{ site.site_type === 'baseline' ? '历史库' : '待上线' }}</small></h3><a :href="`https://${site.domain}`" target="_blank" rel="noreferrer">{{ site.domain }} ↗</a></div></div>
+          <div class="site-identity"><span class="site-avatar">{{ site.name.slice(0, 1) }}</span><div><h3>{{ site.name }} <small :class="['site-type', site.site_type]">{{ site.site_type === 'baseline' ? '历史库' : '待上线' }}</small></h3><a :href="`${site.site_scheme}://${site.domain}`" target="_blank" rel="noreferrer">{{ site.site_scheme }}://{{ site.domain }} ↗</a></div></div>
           <div class="site-metrics"><div><strong>{{ site.page_count }}</strong><span>页面</span></div><div><strong>{{ site.block_count }}</strong><span>文案</span></div></div>
           <div class="crawl-time"><span>最近采集</span><strong>{{ formatDate(site.last_crawled_at) }}</strong></div>
           <span :class="['status-pill', site.status]">{{ site.status === 'active' ? '运行中' : site.status === 'paused' ? '已暂停' : '异常' }}</span>
@@ -286,25 +299,29 @@ onMounted(loadSites)
       </div>
     </div>
 
-    <form v-if="editingStrategyId !== null" class="panel strategy-panel" @submit.prevent="saveStrategy">
-      <div class="panel-title">
-        <div><span class="eyebrow muted">每站独立配置</span><h2>采集策略</h2><p>正则规则按 URL 路径匹配；首页始终保留，不受包含规则限制。</p></div>
-        <button class="text-button" type="button" @click="editingStrategyId = null">关闭</button>
-      </div>
-      <div class="policy-grid">
-        <label><span>只包含这些路由（每行一条正则，留空表示不限制）</span><textarea v-model="strategyForm.includePatterns" rows="5" placeholder="^/about\n^/news"></textarea></label>
-        <label><span>排除这些路由（每行一条正则）</span><textarea v-model="strategyForm.excludePatterns" rows="5" placeholder="^/search\n^/member"></textarea></label>
-        <label><span>允许保留的查询参数</span><input v-model="strategyForm.allowedQueryParams" placeholder="例如：page, lang"></label>
-        <label><span>最多采集页面（留空使用系统默认值）</span><input v-model="strategyForm.crawlerMaxPages" inputmode="numeric" pattern="[0-9]*" placeholder="例如：300"></label>
-        <label><span>请求间隔（毫秒）</span><input v-model.number="strategyForm.requestDelayMs" type="number" min="0" max="5000" step="100"></label>
-        <label><span>最低安全覆盖率（10%–100%）</span><input v-model.number="strategyForm.minCoveragePercent" type="number" min="10" max="100" step="1"></label>
-      </div>
-      <div class="policy-note">正式采集出现请求错误，或本次覆盖率低于这里的阈值时，系统不会清理任何未访问的旧页面。</div>
-      <div class="form-actions"><button class="button ghost" type="button" @click="editingStrategyId = null">取消</button><button class="button primary" :disabled="strategySaving">{{ strategySaving ? '保存中…' : '保存策略' }}</button></div>
-    </form>
+    <div v-if="showStrategyModal && editingStrategyId !== null" class="modal-overlay" @click.self="showStrategyModal = false; editingStrategyId = null">
+      <form class="panel app-modal strategy-modal" @submit.prevent="saveStrategy">
+        <div class="panel-title">
+          <div><span class="eyebrow muted">每站独立配置</span><h2>采集策略</h2><p>正则规则按 URL 路径匹配；首页始终保留，不受包含规则限制。</p></div>
+          <button class="modal-close" type="button" @click="showStrategyModal = false; editingStrategyId = null">×</button>
+        </div>
+        <div class="policy-grid">
+          <label><span>采集协议</span><select v-model="strategyForm.siteScheme"><option value="https">HTTPS</option><option value="http">HTTP</option></select></label>
+          <label><span>只包含这些路由（每行一条正则，留空表示不限制）</span><textarea v-model="strategyForm.includePatterns" rows="5" placeholder="^/about\n^/news"></textarea></label>
+          <label><span>排除这些路由（每行一条正则）</span><textarea v-model="strategyForm.excludePatterns" rows="5" placeholder="^/search\n^/member"></textarea></label>
+          <label><span>允许保留的查询参数</span><input v-model="strategyForm.allowedQueryParams" placeholder="例如：page, lang"></label>
+          <label><span>最多采集页面（留空使用系统默认值）</span><input v-model="strategyForm.crawlerMaxPages" inputmode="numeric" pattern="[0-9]*" placeholder="例如：300"></label>
+          <label><span>请求间隔（毫秒）</span><input v-model.number="strategyForm.requestDelayMs" type="number" min="0" max="5000" step="100"></label>
+          <label><span>最低安全覆盖率（10%–100%）</span><input v-model.number="strategyForm.minCoveragePercent" type="number" min="10" max="100" step="1"></label>
+        </div>
+        <div class="policy-note">正式采集出现请求错误，或本次覆盖率低于这里的阈值时，系统不会清理任何未访问的旧页面。</div>
+        <div class="form-actions"><button class="button ghost" type="button" @click="showStrategyModal = false; editingStrategyId = null">取消</button><button class="button primary" :disabled="strategySaving">{{ strategySaving ? '保存中…' : '保存策略' }}</button></div>
+      </form>
+    </div>
 
-    <section v-if="previewResult" class="panel result-panel preview-panel">
-      <div class="panel-title"><div><span class="eyebrow muted">只读预览</span><h2>{{ previewSiteName }}</h2><p>预览只访问页面并分析路由，不写入页面或文案数据。</p></div><button class="text-button" @click="previewResult = null">关闭</button></div>
+    <div v-if="showPreviewModal && previewResult" class="modal-overlay" @click.self="showPreviewModal = false">
+    <section class="panel app-modal result-panel preview-panel">
+      <div class="panel-title"><div><span class="eyebrow muted">只读预览</span><h2>{{ previewSiteName }}</h2><p>预览只访问页面并分析路由，不写入页面或文案数据。</p></div><button class="modal-close" @click="showPreviewModal = false">×</button></div>
       <div class="preview-summary"><div><strong>{{ previewResult.pages_discovered }}</strong><span>发现链接</span></div><div><strong>{{ previewResult.pages_to_crawl }}</strong><span>将采集页面</span></div><div><strong>{{ previewResult.skipped.length }}</strong><span>已过滤</span></div><div :class="{ high: previewResult.errors.length }"><strong>{{ previewResult.errors.length }}</strong><span>请求错误</span></div></div>
       <div class="preview-columns">
         <div><h3>将采集的 URL</h3><div v-if="!previewResult.urls_to_crawl.length" class="compact-empty">没有可采集页面</div><ul v-else class="url-list"><li v-for="url in previewResult.urls_to_crawl" :key="url"><a :href="url" target="_blank" rel="noreferrer">{{ url }}</a></li></ul></div>
@@ -312,9 +329,11 @@ onMounted(loadSites)
       </div>
       <div v-if="previewResult.errors.length" class="preview-errors"><strong>请求错误</strong><p v-for="error in previewResult.errors" :key="error">{{ error }}</p></div>
     </section>
+    </div>
 
-    <section v-if="crawlRunSiteName" class="panel result-panel run-panel">
-      <div class="panel-title"><div><span class="eyebrow muted">最近 10 次</span><h2>{{ crawlRunSiteName }} · 采集记录</h2><p>可追踪每次采集覆盖率、过滤数量和旧数据保护状态。</p></div><button class="text-button" @click="crawlRunSiteName = ''; crawlRuns = []">关闭</button></div>
+    <div v-if="showRunsModal && crawlRunSiteName" class="modal-overlay" @click.self="showRunsModal = false">
+    <section class="panel app-modal result-panel run-panel">
+      <div class="panel-title"><div><span class="eyebrow muted">最近 10 次</span><h2>{{ crawlRunSiteName }} · 采集记录</h2><p>可追踪每次采集覆盖率、过滤数量和旧数据保护状态。</p></div><button class="modal-close" @click="showRunsModal = false">×</button></div>
       <div v-if="!crawlRuns.length" class="compact-empty">这个网站还没有采集运行记录</div>
       <div v-else class="run-list">
         <article v-for="run in crawlRuns" :key="run.id">
@@ -324,9 +343,11 @@ onMounted(loadSites)
         </article>
       </div>
     </section>
+    </div>
 
-    <section v-if="auditReport" class="panel audit-report">
-      <div class="panel-title"><div><span class="eyebrow muted">整站检测报告</span><h2>{{ auditReport.site_name }}</h2><p>共检测 {{ auditReport.total_blocks }} 条文案，自动排除本站内容，仅与历史基准库比较。</p></div><button class="text-button" @click="auditReport = null">关闭</button></div>
+    <div v-if="showAuditModal && auditReport" class="modal-overlay" @click.self="showAuditModal = false">
+    <section class="panel app-modal audit-report">
+      <div class="panel-title"><div><span class="eyebrow muted">整站检测报告</span><h2>{{ auditReport.site_name }}</h2><p>共检测 {{ auditReport.total_blocks }} 条文案，自动排除本站内容，仅与历史基准库比较。</p></div><button class="modal-close" @click="showAuditModal = false">×</button></div>
       <div class="audit-summary"><div><strong>{{ percent(auditReport.max_similarity) }}</strong><span>最高相似度</span></div><div class="high"><strong>{{ auditReport.high_risk_blocks }}</strong><span>高风险</span></div><div class="medium"><strong>{{ auditReport.medium_risk_blocks }}</strong><span>中风险</span></div><div><strong>{{ auditReport.low_risk_blocks }}</strong><span>低风险</span></div></div>
       <div v-if="!auditReport.findings.length" class="empty-state safe-state"><span class="empty-icon">✓</span><h3>没有发现明显重复</h3></div>
       <div v-else class="audit-findings">
@@ -337,5 +358,6 @@ onMounted(loadSites)
         </article>
       </div>
     </section>
+    </div>
   </section>
 </template>

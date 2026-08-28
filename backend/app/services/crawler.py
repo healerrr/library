@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import Settings
 from app.models import ContentBlock, CrawlRun, Page, Site
 from app.services.embeddings import EmbeddingService
-from app.services.ssrf import UnsafeUrlError, canonical_domain, validate_target_url
+from app.services.ssrf import UnsafeUrlError, canonical_domain, domain_endpoint, validate_target_url
 from app.services.text import CAS_RE, clean_display_text, content_hash, embedding_text, normalize_text
 
 
@@ -186,8 +186,10 @@ def normalize_internal_link(
     parsed = urlsplit(candidate)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         return None
-    allowed_hosts = {canonical_domain(domain) for domain in domains}
-    if canonical_domain(parsed.hostname) not in allowed_hosts:
+    default_port = 443 if parsed.scheme == "https" else 80
+    candidate_endpoint = (canonical_domain(parsed.hostname), parsed.port or default_port)
+    allowed_endpoints = {domain_endpoint(domain, parsed.scheme) for domain in domains}
+    if candidate_endpoint not in allowed_endpoints:
         return None
     path = unquote(parsed.path).lower()
     if any(path.endswith(extension) for extension in SKIP_FILE_EXTENSIONS):
@@ -199,7 +201,8 @@ def normalize_internal_link(
     # slash cannot consume multiple crawl slots.
     scheme = urlsplit(base_url).scheme or parsed.scheme
     host = parsed.hostname.lower()
-    port = f":{parsed.port}" if parsed.port and parsed.port not in {80, 443} else ""
+    standard_port = 443 if scheme == "https" else 80
+    port = f":{parsed.port}" if parsed.port and parsed.port != standard_port else ""
     normalized_path = parsed.path or "/"
     allowed_query_params = allowed_query_params or set()
     query = urlencode(
@@ -335,7 +338,7 @@ class CrawlerService:
 
     async def preview(self, site: Site) -> dict:
         domains = {site.domain}
-        homepage = f"https://{site.domain}/"
+        homepage = f"{site.site_scheme}://{site.domain}/"
         maximum = site.crawler_max_pages or self.settings.crawler_max_pages
         allowed_query_params = set(site.allowed_query_params or [])
         queue: deque[str] = deque([homepage])
@@ -412,7 +415,8 @@ class CrawlerService:
         }
 
     async def crawl(self, session: AsyncSession, site: Site) -> dict:
-        site_id = site.id
+        site_id = int(site.id)
+        minimum_coverage = float(site.min_crawl_coverage)
         domains = {site.domain}
         maximum = site.crawler_max_pages or self.settings.crawler_max_pages
         allowed_query_params = set(site.allowed_query_params or [])
@@ -430,12 +434,13 @@ class CrawlerService:
         session.add(crawl_run)
         await session.commit()
         await session.refresh(crawl_run)
+        crawl_run_id = int(crawl_run.id)
 
         async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
             # The homepage is the source of truth.  Following only same-domain
             # anchors avoids footer friend links, while a bounded BFS reaches
             # the site's real navigation without depending on sitemap.xml.
-            homepage = f"https://{site.domain}/"
+            homepage = f"{site.site_scheme}://{site.domain}/"
             queue: deque[str] = deque([homepage])
             queued = {homepage}
             visited: set[str] = set()
@@ -549,8 +554,10 @@ class CrawlerService:
                     pages_crawled += 1
                     blocks_saved += len(unique_blocks)
                 except Exception as exc:  # Keep one bad page from aborting the site crawl.
+                    error_message = str(exc)[:180]
                     await session.rollback()
-                    errors.append(f"{url}: {str(exc)[:180]}")
+                    await session.refresh(site)
+                    errors.append(f"{url}: {error_message}")
 
         stored_pages = list((await session.scalars(select(Page).where(Page.site_id == site_id))).all())
         stale_pages = sum(page.url not in retained_urls for page in stored_pages)
@@ -558,7 +565,7 @@ class CrawlerService:
         prune_blocked = should_block_page_pruning(
             stale_pages=stale_pages,
             coverage=coverage,
-            minimum_coverage=site.min_crawl_coverage,
+            minimum_coverage=minimum_coverage,
             errors=errors,
         )
         if retained_urls and not prune_blocked:
@@ -568,7 +575,7 @@ class CrawlerService:
         if managed_site is not None:
             managed_site.last_crawled_at = datetime.now(timezone.utc)
             managed_site.status = "active" if pages_crawled or self._skipped_dynamic_urls else "error"
-        crawl_run = await session.get(CrawlRun, crawl_run.id)
+        crawl_run = await session.get(CrawlRun, crawl_run_id)
         if crawl_run is not None:
             crawl_run.status = "completed_with_warnings" if errors or prune_blocked else "completed"
             crawl_run.pages_discovered = len(discovered)

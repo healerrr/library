@@ -1,3 +1,5 @@
+import pytest
+
 from app.services.crawler import (
     crawl_policy_reason,
     extract_internal_links,
@@ -9,6 +11,7 @@ from app.services.crawler import (
 )
 from app.models import Site
 from app.schemas import SiteCreate
+from app.services.ssrf import UnsafeUrlError, validate_url_format
 
 
 def test_cas_product_url_is_dynamic() -> None:
@@ -87,6 +90,25 @@ def test_candidate_site_type_is_supported() -> None:
     assert site.site_type == "candidate"
 
 
+def test_http_site_with_non_standard_port_is_preserved() -> None:
+    site = SiteCreate(
+        name="Port site",
+        domain="http://spider.aikonchem.com:30045/",
+        site_scheme="http",
+    )
+    assert site.domain == "spider.aikonchem.com:30045"
+    assert site.site_scheme == "http"
+
+
+def test_route_rules_accept_newline_separated_input() -> None:
+    site = SiteCreate(
+        name="Example",
+        domain="example.com",
+        include_patterns="^/about\n^/news",  # type: ignore[arg-type]
+    )
+    assert site.include_patterns == ["^/about", "^/news"]
+
+
 def policy_site(*, include: list[str] | None = None, exclude: list[str] | None = None) -> Site:
     return Site(
         name="Policy site",
@@ -119,6 +141,29 @@ def test_query_parameters_are_removed_without_whitelist() -> None:
         {"example.com"},
     )
     assert url == "https://example.com/news"
+
+
+def test_non_standard_port_links_stay_on_configured_endpoint() -> None:
+    base_url = "http://spider.aikonchem.com:30045/"
+    domains = {"spider.aikonchem.com:30045"}
+    assert normalize_internal_link("/about", base_url, domains) == (
+        "http://spider.aikonchem.com:30045/about"
+    )
+    assert normalize_internal_link(
+        "http://spider.aikonchem.com:30046/about",
+        base_url,
+        domains,
+    ) is None
+
+
+def test_ssrf_validation_allows_only_configured_non_standard_port() -> None:
+    domains = {"spider.aikonchem.com:30045"}
+    assert validate_url_format(
+        "http://spider.aikonchem.com:30045/about",
+        domains,
+    ) == ("spider.aikonchem.com", 30045)
+    with pytest.raises(UnsafeUrlError):
+        validate_url_format("http://spider.aikonchem.com:30046/about", domains)
 
 
 def test_exclude_rule_reports_matching_pattern() -> None:

@@ -39,6 +39,10 @@ async def initialize_database() -> None:
             await connection.execute(
                 text("ALTER TABLE sites ADD COLUMN site_type VARCHAR(32) NOT NULL DEFAULT 'baseline'")
             )
+        if "site_scheme" not in site_columns:
+            await connection.execute(
+                text("ALTER TABLE sites ADD COLUMN site_scheme VARCHAR(8) NOT NULL DEFAULT 'https'")
+            )
         await connection.execute(text("CREATE INDEX IF NOT EXISTS ix_sites_site_type ON sites (site_type)"))
         policy_columns = {
             "include_patterns": "JSON NOT NULL DEFAULT '[]'",

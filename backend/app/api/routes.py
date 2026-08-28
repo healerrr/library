@@ -51,6 +51,7 @@ def site_dict(
         "name": site.name,
         "domain": site.domain,
         "sitemap_url": site.sitemap_url,
+        "site_scheme": site.site_scheme,
         "site_type": site.site_type,
         "include_patterns": site.include_patterns or [],
         "exclude_patterns": site.exclude_patterns or [],

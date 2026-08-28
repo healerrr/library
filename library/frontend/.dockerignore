@@ -1,7 +1,0 @@
-.env*
-node_modules/
-.nuxt/
-.output/
-.data/
-npm-debug.log*
-.git/
