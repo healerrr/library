@@ -53,6 +53,7 @@ def site_dict(
         "sitemap_url": site.sitemap_url,
         "site_scheme": site.site_scheme,
         "site_type": site.site_type,
+        "product_routes": site.product_routes or [],
         "include_patterns": site.include_patterns or [],
         "exclude_patterns": site.exclude_patterns or [],
         "allowed_query_params": site.allowed_query_params or [],

@@ -20,9 +20,10 @@ const editingStrategyId = ref<number | null>(null)
 const strategySaving = ref(false)
 const message = ref<{ type: 'success' | 'error'; text: string } | null>(null)
 const showForm = ref(false)
-const form = reactive({ name: '', domain: '', site_scheme: 'https', site_type: 'baseline', status: 'active' })
+const form = reactive({ name: '', domain: '', site_scheme: 'https', site_type: 'baseline', productRoutes: '' })
 const strategyForm = reactive({
   siteScheme: 'https',
+  productRoutes: '',
   includePatterns: '',
   excludePatterns: '',
   allowedQueryParams: '',
@@ -55,8 +56,17 @@ function notify(type: 'success' | 'error', err: unknown) {
 async function createSite() {
   saving.value = true
   try {
-    await api<Site>('/sites', { method: 'POST', body: form })
-    Object.assign(form, { name: '', domain: '', site_scheme: 'https', site_type: 'baseline', status: 'active' })
+    await api<Site>('/sites', {
+      method: 'POST',
+      body: {
+        name: form.name,
+        domain: form.domain,
+        site_scheme: form.site_scheme,
+        site_type: form.site_type,
+        product_routes: splitCommaValues(form.productRoutes),
+      },
+    })
+    Object.assign(form, { name: '', domain: '', site_scheme: 'https', site_type: 'baseline', productRoutes: '' })
     showForm.value = false
     notify('success', '网站已添加，可以开始采集')
     await loadSites()
@@ -169,10 +179,15 @@ function splitQueryParams(value: string) {
   return [...new Set(value.split(/[\n,]/).map(item => item.trim()).filter(Boolean))]
 }
 
+function splitCommaValues(value: string) {
+  return [...new Set(value.split(/[,\n]/).map(item => item.trim()).filter(Boolean))]
+}
+
 function openStrategy(site: Site) {
   editingStrategyId.value = site.id
   Object.assign(strategyForm, {
     siteScheme: site.site_scheme,
+    productRoutes: site.product_routes.join(', '),
     includePatterns: site.include_patterns.join('\n'),
     excludePatterns: site.exclude_patterns.join('\n'),
     allowedQueryParams: site.allowed_query_params.join(', '),
@@ -192,6 +207,7 @@ async function saveStrategy() {
       method: 'PATCH',
       body: {
         site_scheme: strategyForm.siteScheme,
+        product_routes: splitCommaValues(strategyForm.productRoutes),
         include_patterns: splitRuleLines(strategyForm.includePatterns),
         exclude_patterns: splitRuleLines(strategyForm.excludePatterns),
         allowed_query_params: splitQueryParams(strategyForm.allowedQueryParams),
@@ -267,7 +283,7 @@ onMounted(loadSites)
           <label><span>域名</span><input v-model="form.domain" required placeholder="example.com"></label>
           <label><span>协议</span><select v-model="form.site_scheme"><option value="https">HTTPS</option><option value="http">HTTP</option></select></label>
           <label><span>用途</span><select v-model="form.site_type"><option value="baseline">历史基准站点</option><option value="candidate">待上线检测站点</option></select></label>
-          <label><span>状态</span><select v-model="form.status"><option value="active">启用</option><option value="paused">暂停</option></select></label>
+          <label class="wide"><span>产品相关路由（必填，多个用逗号分隔）</span><input v-model="form.productRoutes" required placeholder="例如：product, category"></label>
         </div>
         <div class="form-actions"><button class="button ghost" type="button" @click="showForm = false">取消</button><button class="button primary" :disabled="saving">{{ saving ? '保存中…' : '保存网站' }}</button></div>
       </form>
@@ -307,6 +323,7 @@ onMounted(loadSites)
         </div>
         <div class="policy-grid">
           <label><span>采集协议</span><select v-model="strategyForm.siteScheme"><option value="https">HTTPS</option><option value="http">HTTP</option></select></label>
+          <label><span>产品相关路由（必填，多个用逗号分隔）</span><input v-model="strategyForm.productRoutes" required placeholder="product, category"></label>
           <label><span>只包含这些路由（每行一条正则，留空表示不限制）</span><textarea v-model="strategyForm.includePatterns" rows="5" placeholder="^/about\n^/news"></textarea></label>
           <label><span>排除这些路由（每行一条正则）</span><textarea v-model="strategyForm.excludePatterns" rows="5" placeholder="^/search\n^/member"></textarea></label>
           <label><span>允许保留的查询参数</span><input v-model="strategyForm.allowedQueryParams" placeholder="例如：page, lang"></label>

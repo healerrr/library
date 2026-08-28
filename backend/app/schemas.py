@@ -30,6 +30,7 @@ class SiteCreate(BaseModel):
     site_scheme: str = Field(default="https", pattern=r"^(http|https)$")
     status: str = "active"
     site_type: str = "baseline"
+    product_routes: list[str] = Field(min_length=1, max_length=50)
     include_patterns: list[str] = Field(default_factory=list, max_length=50)
     exclude_patterns: list[str] = Field(default_factory=list, max_length=50)
     allowed_query_params: list[str] = Field(default_factory=list, max_length=30)
@@ -73,6 +74,24 @@ class SiteCreate(BaseModel):
             raise ValueError("无效的网站类型")
         return value
 
+    @field_validator("product_routes", mode="before")
+    @classmethod
+    def valid_product_routes(cls, values: list[str] | str) -> list[str]:
+        if isinstance(values, str):
+            values = re.split(r"[,\n]", values)
+        cleaned: list[str] = []
+        for value in values:
+            route = value.strip().strip("/").casefold()
+            if not route:
+                continue
+            if not re.fullmatch(r"[a-z0-9._~-]+(?:/[a-z0-9._~-]+)*", route):
+                raise ValueError(f"无效的产品相关路由：{value}")
+            if route not in cleaned:
+                cleaned.append(route)
+        if not cleaned:
+            raise ValueError("请至少填写一个产品相关路由")
+        return cleaned
+
     @field_validator("include_patterns", "exclude_patterns", mode="before")
     @classmethod
     def valid_route_patterns(cls, values: list[str] | str) -> list[str]:
@@ -112,6 +131,7 @@ class SiteUpdate(BaseModel):
     site_scheme: str | None = Field(default=None, pattern=r"^(http|https)$")
     status: str | None = None
     site_type: str | None = None
+    product_routes: list[str] | None = Field(default=None, min_length=1, max_length=50)
     include_patterns: list[str] | None = Field(default=None, max_length=50)
     exclude_patterns: list[str] | None = Field(default=None, max_length=50)
     allowed_query_params: list[str] | None = Field(default=None, max_length=30)
@@ -132,6 +152,13 @@ class SiteUpdate(BaseModel):
         if value is not None and value not in VALID_SITE_TYPES:
             raise ValueError("无效的网站类型")
         return value
+
+    @field_validator("product_routes", mode="before")
+    @classmethod
+    def valid_product_routes(cls, values: list[str] | str | None) -> list[str] | None:
+        if values is None:
+            return None
+        return SiteCreate.valid_product_routes(values)
 
     @field_validator("include_patterns", "exclude_patterns", mode="before")
     @classmethod
@@ -159,6 +186,7 @@ class SiteOut(BaseModel):
     sitemap_url: str
     site_scheme: str
     site_type: str
+    product_routes: list[str]
     include_patterns: list[str]
     exclude_patterns: list[str]
     allowed_query_params: list[str]

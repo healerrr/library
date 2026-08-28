@@ -45,6 +45,7 @@ async def initialize_database() -> None:
             )
         await connection.execute(text("CREATE INDEX IF NOT EXISTS ix_sites_site_type ON sites (site_type)"))
         policy_columns = {
+            "product_routes": "JSON NOT NULL DEFAULT '[]'",
             "include_patterns": "JSON NOT NULL DEFAULT '[]'",
             "exclude_patterns": "JSON NOT NULL DEFAULT '[]'",
             "allowed_query_params": "JSON NOT NULL DEFAULT '[]'",

@@ -33,6 +33,7 @@ class Site(Base):
     sitemap_url: Mapped[str] = mapped_column(String(2048))
     site_scheme: Mapped[str] = mapped_column(String(8), default="https", server_default="https")
     site_type: Mapped[str] = mapped_column(String(32), default="baseline", server_default="baseline", index=True)
+    product_routes: Mapped[list[str]] = mapped_column(JSON, default=list)
     include_patterns: Mapped[list[str]] = mapped_column(JSON, default=list)
     exclude_patterns: Mapped[list[str]] = mapped_column(JSON, default=list)
     allowed_query_params: Mapped[list[str]] = mapped_column(JSON, default=list)

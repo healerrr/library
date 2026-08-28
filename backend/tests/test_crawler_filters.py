@@ -7,6 +7,7 @@ from app.services.crawler import (
     is_dynamic_product_url,
     is_product_data_url,
     normalize_internal_link,
+    product_route_matches,
     should_block_page_pruning,
 )
 from app.models import Site
@@ -80,13 +81,18 @@ def test_login_and_points_mall_routes_are_not_discovered() -> None:
 
 
 def test_sitemap_is_optional_when_creating_site() -> None:
-    site = SiteCreate(name="Example", domain="example.com")
+    site = SiteCreate(name="Example", domain="example.com", product_routes=["product"])
     assert site.sitemap_url == ""
     assert site.site_type == "baseline"
 
 
 def test_candidate_site_type_is_supported() -> None:
-    site = SiteCreate(name="Candidate", domain="candidate.example.com", site_type="candidate")
+    site = SiteCreate(
+        name="Candidate",
+        domain="candidate.example.com",
+        site_type="candidate",
+        product_routes=["product"],
+    )
     assert site.site_type == "candidate"
 
 
@@ -95,6 +101,7 @@ def test_http_site_with_non_standard_port_is_preserved() -> None:
         name="Port site",
         domain="http://spider.aikonchem.com:30045/",
         site_scheme="http",
+        product_routes=["product"],
     )
     assert site.domain == "spider.aikonchem.com:30045"
     assert site.site_scheme == "http"
@@ -104,9 +111,21 @@ def test_route_rules_accept_newline_separated_input() -> None:
     site = SiteCreate(
         name="Example",
         domain="example.com",
+        product_routes=["product"],
         include_patterns="^/about\n^/news",  # type: ignore[arg-type]
     )
     assert site.include_patterns == ["^/about", "^/news"]
+
+
+def test_product_routes_are_required_and_accept_comma_separated_input() -> None:
+    with pytest.raises(ValueError, match="product_routes"):
+        SiteCreate(name="Example", domain="example.com")
+    site = SiteCreate(
+        name="Example",
+        domain="example.com",
+        product_routes="product, category,product",  # type: ignore[arg-type]
+    )
+    assert site.product_routes == ["product", "category"]
 
 
 def policy_site(*, include: list[str] | None = None, exclude: list[str] | None = None) -> Site:
@@ -116,6 +135,7 @@ def policy_site(*, include: list[str] | None = None, exclude: list[str] | None =
         sitemap_url="",
         site_type="baseline",
         status="active",
+        product_routes=["product"],
         include_patterns=include or [],
         exclude_patterns=exclude or [],
         allowed_query_params=[],
@@ -141,6 +161,22 @@ def test_query_parameters_are_removed_without_whitelist() -> None:
         {"example.com"},
     )
     assert url == "https://example.com/news"
+
+
+def test_product_routes_match_complete_path_segments() -> None:
+    assert product_route_matches("product", "/product/ABC-123")
+    assert product_route_matches("category", "/en/category/reagents")
+    assert product_route_matches("catalog/product", "/en/catalog/product/ABC-123")
+    assert not product_route_matches("product", "/news/product-launch")
+    assert not product_route_matches("product", "/products/ABC-123")
+
+
+def test_crawl_policy_filters_configured_product_routes() -> None:
+    site = policy_site()
+    assert crawl_policy_reason("https://example.com/product/ABC-123", site) == (
+        "命中产品相关路由：product"
+    )
+    assert crawl_policy_reason("https://example.com/news/product-launch", site) is None
 
 
 def test_non_standard_port_links_stay_on_configured_endpoint() -> None:

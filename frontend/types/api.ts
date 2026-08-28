@@ -5,6 +5,7 @@ export interface Site {
   sitemap_url: string
   site_scheme: 'http' | 'https'
   site_type: 'baseline' | 'candidate'
+  product_routes: string[]
   include_patterns: string[]
   exclude_patterns: string[]
   allowed_query_params: string[]

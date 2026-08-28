@@ -243,12 +243,32 @@ def crawl_link_priority(url: str) -> tuple[int, int, str]:
     return content_priority, len(segments), url
 
 
+def product_route_matches(route: str, target_path: str) -> bool:
+    """Match configured product routes as complete URL path segments."""
+    route_segments = [segment.casefold() for segment in route.strip("/").split("/") if segment]
+    target_segments = [
+        segment.casefold()
+        for segment in unquote(target_path).strip("/").split("/")
+        if segment
+    ]
+    if not route_segments or len(route_segments) > len(target_segments):
+        return False
+    width = len(route_segments)
+    return any(
+        target_segments[index:index + width] == route_segments
+        for index in range(len(target_segments) - width + 1)
+    )
+
+
 def crawl_policy_reason(url: str, site: Site, *, homepage: str | None = None) -> str | None:
     if homepage and url.rstrip("/") == homepage.rstrip("/"):
         return None
+    target = unquote(urlsplit(url).path)
+    for route in site.product_routes or []:
+        if product_route_matches(route, target):
+            return f"命中产品相关路由：{route}"
     if is_product_data_url(url):
         return "产品目录或动态数据路由"
-    target = unquote(urlsplit(url).path)
     for pattern in site.exclude_patterns or []:
         if re.search(pattern, target, re.IGNORECASE):
             return f"命中排除规则：{pattern}"
