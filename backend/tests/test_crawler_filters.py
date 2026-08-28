@@ -5,6 +5,7 @@ from app.services.crawler import (
     is_dynamic_product_url,
     is_product_data_url,
     normalize_internal_link,
+    route_rule_matches,
     should_block_page_pruning,
 )
 from app.models import Site
@@ -87,6 +88,24 @@ def test_candidate_site_type_is_supported() -> None:
     assert site.site_type == "candidate"
 
 
+def test_simple_route_rules_are_validated_and_deduplicated() -> None:
+    site = SiteCreate(
+        name="Example",
+        domain="example.com",
+        include_patterns=[" /about ", "/about", "/news/"],
+    )
+    assert site.include_patterns == ["/about", "/news/"]
+
+
+def test_simple_route_rule_must_start_with_slash() -> None:
+    try:
+        SiteCreate(name="Example", domain="example.com", include_patterns=["about"])
+    except ValueError as exc:
+        assert "必须以 / 开头" in str(exc)
+    else:
+        raise AssertionError("未拒绝缺少前导斜杠的路径规则")
+
+
 def policy_site(*, include: list[str] | None = None, exclude: list[str] | None = None) -> Site:
     return Site(
         name="Policy site",
@@ -121,15 +140,35 @@ def test_query_parameters_are_removed_without_whitelist() -> None:
     assert url == "https://example.com/news"
 
 
+def test_exact_route_matches_only_current_page() -> None:
+    assert route_rule_matches("/about", "/about")
+    assert route_rule_matches("/about", "/about/")
+    assert route_rule_matches("/ABOUT", "/about")
+    assert not route_rule_matches("/about", "/about/team")
+    assert not route_rule_matches("/about", "/about-us")
+
+
+def test_directory_route_matches_page_and_descendants() -> None:
+    assert route_rule_matches("/about/", "/about")
+    assert route_rule_matches("/about/", "/about/")
+    assert route_rule_matches("/about/", "/about/team")
+    assert not route_rule_matches("/about/", "/about-us")
+
+
+def test_legacy_regex_route_rule_remains_supported() -> None:
+    assert route_rule_matches(r"^/(about|news)", "/news/company")
+    assert route_rule_matches(r"re:^/member", "/member/login")
+
+
 def test_exclude_rule_reports_matching_pattern() -> None:
     site = policy_site(exclude=[r"^/member"])
-    assert crawl_policy_reason("https://example.com/member/login", site) == "命中排除规则：^/member"
+    assert crawl_policy_reason("https://example.com/member/login", site) == "命中排除路径：^/member"
 
 
 def test_include_rule_rejects_non_matching_route_but_keeps_homepage() -> None:
     site = policy_site(include=[r"^/(about|news)"])
     homepage = "https://example.com/"
-    assert crawl_policy_reason("https://example.com/contact", site, homepage=homepage) == "不在包含规则内"
+    assert crawl_policy_reason("https://example.com/contact", site, homepage=homepage) == "不在包含路径内"
     assert crawl_policy_reason(homepage, site, homepage=homepage) is None
 
 

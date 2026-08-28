@@ -75,11 +75,17 @@ class SiteCreate(BaseModel):
             if not pattern:
                 continue
             if len(pattern) > 300:
-                raise ValueError("单条路由规则不能超过300个字符")
-            try:
-                re.compile(pattern)
-            except re.error as exc:
-                raise ValueError(f"无效的路由正则：{pattern}") from exc
+                raise ValueError("单条路径规则不能超过300个字符")
+            if pattern.startswith("re:") or pattern.startswith("^"):
+                expression = pattern[3:] if pattern.startswith("re:") else pattern
+                try:
+                    re.compile(expression)
+                except re.error as exc:
+                    raise ValueError(f"无效的兼容正则规则：{pattern}") from exc
+            elif not pattern.startswith("/"):
+                raise ValueError(f"路径规则必须以 / 开头：{pattern}")
+            elif "?" in pattern or "#" in pattern:
+                raise ValueError(f"路径规则不能包含查询参数或锚点：{pattern}")
             if pattern not in cleaned:
                 cleaned.append(pattern)
         return cleaned
