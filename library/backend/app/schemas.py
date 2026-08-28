@@ -77,7 +77,6 @@ class SiteCreate(BaseModel):
         return value
 
     @field_validator("include_patterns", "exclude_patterns")
-    @field_validator("include_patterns", "exclude_patterns")
     @classmethod
     def valid_route_patterns(cls, values: list[str] | str) -> list[str]:
         """支持列表或换行分隔的字符串，自动解析并验证正则规则。"""
@@ -146,8 +145,7 @@ class SiteUpdate(BaseModel):
             return None
         # 如果是字符串，按换行分割
         if isinstance(values, str):
-            values = [v.strip() for v in values.split('
-') if v.strip()]
+            values = [v.strip() for v in values.split('\n') if v.strip()]
         return SiteCreate.valid_route_patterns(values)
 
     @field_validator("allowed_query_params")

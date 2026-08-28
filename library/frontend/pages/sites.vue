@@ -319,7 +319,7 @@ onMounted(loadSites)
       </form>
     </div>
 
-    <div v-if="showPreviewModal" class="modal-overlay" @click.self="showPreviewModal = false">
+    <div v-if="showPreviewModal && previewResult" class="modal-overlay" @click.self="showPreviewModal = false">
       <div class="modal preview-modal">
         <div class="modal-header">
           <div><span class="eyebrow muted">只读预览</span><h2>{{ previewSiteName }}</h2><p>预览只访问页面并分析路由，不写入页面或文案数据。</p></div>
@@ -351,7 +351,7 @@ onMounted(loadSites)
       </div>
     </div>
 
-    <div v-if="showAuditModal" class="modal-overlay" @click.self="showAuditModal = false">
+    <div v-if="showAuditModal && auditReport" class="modal-overlay" @click.self="showAuditModal = false">
       <div class="modal audit-modal">
         <div class="modal-header">
           <div><span class="eyebrow muted">整站检测报告</span><h2>{{ auditReport.site_name }}</h2><p>共检测 {{ auditReport.total_blocks }} 条文案，自动排除本站内容，仅与历史基准库比较。</p></div>
