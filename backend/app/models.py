@@ -48,6 +48,32 @@ class Site(Base):
     pages: Mapped[list["Page"]] = relationship(back_populates="site", cascade="all, delete-orphan")
     jobs: Mapped[list["BackgroundJob"]] = relationship(back_populates="site", cascade="all, delete-orphan")
     crawl_runs: Mapped[list["CrawlRun"]] = relationship(back_populates="site", cascade="all, delete-orphan")
+    email_templates: Mapped[list["EmailTemplate"]] = relationship(
+        back_populates="site",
+        cascade="all, delete-orphan",
+    )
+
+
+class EmailTemplate(Base):
+    __tablename__ = "email_templates"
+
+    id: Mapped[int] = mapped_column(ID_TYPE, primary_key=True, autoincrement=True)
+    site_id: Mapped[int] = mapped_column(
+        ID_TYPE,
+        ForeignKey("sites.id", ondelete="CASCADE"),
+        index=True,
+    )
+    title: Mapped[str] = mapped_column(String(200))
+    content_html: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        index=True,
+    )
+
+    site: Mapped[Site] = relationship(back_populates="email_templates")
 
 
 class BackgroundJob(Base):

@@ -4,6 +4,8 @@ from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.services.email_html import sanitize_rich_text
+
 
 VALID_SITE_STATUSES = {"active", "paused", "error"}
 VALID_SITE_TYPES = {"baseline", "candidate"}
@@ -199,6 +201,56 @@ class SiteOut(BaseModel):
     page_count: int = 0
     block_count: int = 0
     outdated_block_count: int = 0
+    email_template_count: int = 0
+
+
+class EmailTemplateCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    content_html: str = Field(min_length=1, max_length=200_000)
+
+    @field_validator("title", mode="before")
+    @classmethod
+    def clean_title(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("邮件模板标题不能为空")
+        return cleaned
+
+    @field_validator("content_html")
+    @classmethod
+    def clean_content_html(cls, value: str) -> str:
+        cleaned, plain_text = sanitize_rich_text(value)
+        if not plain_text:
+            raise ValueError("邮件模板正文不能为空")
+        return cleaned
+
+
+class EmailTemplateUpdate(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    content_html: str | None = Field(default=None, min_length=1, max_length=200_000)
+
+    @field_validator("title", mode="before")
+    @classmethod
+    def clean_title(cls, value: str | None) -> str | None:
+        return EmailTemplateCreate.clean_title(value) if value is not None else None
+
+    @field_validator("content_html")
+    @classmethod
+    def clean_content_html(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return EmailTemplateCreate.clean_content_html(value)
+
+
+class EmailTemplateOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    site_id: int
+    title: str
+    content_html: str
+    created_at: datetime
+    updated_at: datetime
 
 
 class CrawlSummary(BaseModel):

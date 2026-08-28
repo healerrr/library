@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import type { BackgroundJob, CrawlPreview, CrawlRun, CrawlSummary, ReindexResult, Site, SiteAuditReport } from '~/types/api'
+import type { BackgroundJob, CrawlPreview, CrawlRun, CrawlSummary, EmailTemplate, ReindexResult, Site, SiteAuditReport } from '~/types/api'
 
 const { api } = useApi()
 const sites = ref<Site[]>([])
@@ -35,6 +35,17 @@ const showStrategyModal = ref(false)
 const showPreviewModal = ref(false)
 const showAuditModal = ref(false)
 const showRunsModal = ref(false)
+const showEmailTemplatesModal = ref(false)
+const showTemplateEditorModal = ref(false)
+const emailTemplateSite = ref<Site | null>(null)
+const emailTemplates = ref<EmailTemplate[]>([])
+const templateSearch = ref('')
+const templatesLoading = ref(false)
+const loadingTemplatesId = ref<number | null>(null)
+const templateSaving = ref(false)
+const editingTemplateId = ref<number | null>(null)
+const templateEditor = ref<HTMLDivElement | null>(null)
+const templateForm = reactive({ title: '', contentHtml: '' })
 const busy = computed(() => crawlingId.value !== null || previewingId.value !== null || auditingId.value !== null || reindexingId.value !== null)
 
 async function loadSites() {
@@ -240,6 +251,134 @@ async function showCrawlRuns(site: Site) {
   }
 }
 
+async function loadEmailTemplates() {
+  if (!emailTemplateSite.value) return
+  templatesLoading.value = true
+  try {
+    emailTemplates.value = await api<EmailTemplate[]>(`/sites/${emailTemplateSite.value.id}/email-templates`, {
+      query: { search: templateSearch.value.trim() || undefined },
+    })
+  } catch (err) {
+    notify('error', err)
+  } finally {
+    templatesLoading.value = false
+  }
+}
+
+async function openEmailTemplates(site: Site) {
+  loadingTemplatesId.value = site.id
+  emailTemplateSite.value = site
+  templateSearch.value = ''
+  emailTemplates.value = []
+  showEmailTemplatesModal.value = true
+  try {
+    await loadEmailTemplates()
+  } finally {
+    loadingTemplatesId.value = null
+  }
+}
+
+function closeEmailTemplates() {
+  showTemplateEditorModal.value = false
+  showEmailTemplatesModal.value = false
+  emailTemplateSite.value = null
+  emailTemplates.value = []
+}
+
+async function setEditorHtml(html: string) {
+  await nextTick()
+  if (templateEditor.value) templateEditor.value.innerHTML = html
+}
+
+function openNewTemplate() {
+  editingTemplateId.value = null
+  Object.assign(templateForm, { title: '', contentHtml: '' })
+  showTemplateEditorModal.value = true
+  void setEditorHtml('')
+}
+
+function openEditTemplate(template: EmailTemplate) {
+  editingTemplateId.value = template.id
+  Object.assign(templateForm, { title: template.title, contentHtml: template.content_html })
+  showTemplateEditorModal.value = true
+  void setEditorHtml(template.content_html)
+}
+
+function closeTemplateEditor() {
+  showTemplateEditorModal.value = false
+  editingTemplateId.value = null
+  Object.assign(templateForm, { title: '', contentHtml: '' })
+}
+
+function syncTemplateHtml() {
+  templateForm.contentHtml = templateEditor.value?.innerHTML || ''
+}
+
+function formatTemplate(command: string, value?: string) {
+  templateEditor.value?.focus()
+  document.execCommand(command, false, value)
+  syncTemplateHtml()
+}
+
+function addTemplateLink() {
+  const href = window.prompt('请输入链接地址（https:// 或 mailto:）')?.trim()
+  if (!href) return
+  if (!/^(https?:\/\/|mailto:)/i.test(href)) {
+    notify('error', '链接必须以 http://、https:// 或 mailto: 开头')
+    return
+  }
+  formatTemplate('createLink', href)
+}
+
+async function saveEmailTemplate() {
+  if (!emailTemplateSite.value) return
+  syncTemplateHtml()
+  if (!templateEditor.value?.innerText.trim()) {
+    notify('error', '邮件模板正文不能为空')
+    return
+  }
+  templateSaving.value = true
+  try {
+    const path = editingTemplateId.value === null
+      ? `/sites/${emailTemplateSite.value.id}/email-templates`
+      : `/sites/${emailTemplateSite.value.id}/email-templates/${editingTemplateId.value}`
+    await api<EmailTemplate>(path, {
+      method: editingTemplateId.value === null ? 'POST' : 'PATCH',
+      body: { title: templateForm.title, content_html: templateForm.contentHtml },
+    })
+    notify('success', editingTemplateId.value === null ? '邮件模板已添加' : '邮件模板已更新')
+    closeTemplateEditor()
+    await Promise.all([loadEmailTemplates(), loadSites()])
+  } catch (err) {
+    notify('error', err)
+  } finally {
+    templateSaving.value = false
+  }
+}
+
+async function removeEmailTemplate(template: EmailTemplate) {
+  if (!emailTemplateSite.value || !window.confirm(`删除邮件模板“${template.title}”？`)) return
+  try {
+    await api<void>(`/sites/${emailTemplateSite.value.id}/email-templates/${template.id}`, { method: 'DELETE' })
+    notify('success', '邮件模板已删除')
+    await Promise.all([loadEmailTemplates(), loadSites()])
+  } catch (err) {
+    notify('error', err)
+  }
+}
+
+function templateSummary(value: string) {
+  return value
+    .replace(/<br\s*\/?\s*>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
 async function toggleStatus(site: Site) {
   const status = site.status === 'paused' ? 'active' : 'paused'
   try {
@@ -306,6 +445,7 @@ onMounted(loadSites)
             <button class="button small ghost" :disabled="busy" @click="preview(site)">{{ previewingId === site.id ? `预览 ${jobProgress}%` : '采集预览' }}</button>
             <button v-if="site.site_type === 'candidate'" class="button small ghost" :disabled="busy || !site.block_count" @click="audit(site)">{{ auditingId === site.id ? `检测 ${jobProgress}%` : '整站检测' }}</button>
             <button v-if="site.outdated_block_count" class="button small warning" :disabled="busy" @click="reindex(site)">{{ reindexingId === site.id ? `更新 ${jobProgress}%` : `更新向量 ${site.outdated_block_count}` }}</button>
+            <button class="button small ghost template-entry" :disabled="loadingTemplatesId !== null" @click="openEmailTemplates(site)">{{ loadingTemplatesId === site.id ? '读取中…' : `邮件模板${site.email_template_count ? ` ${site.email_template_count}` : ''}` }}</button>
             <button class="icon-button" title="采集策略" @click="openStrategy(site)">策</button>
             <button class="icon-button" title="采集记录" :disabled="loadingRunsId !== null" @click="showCrawlRuns(site)">{{ loadingRunsId === site.id ? '…' : '录' }}</button>
             <button class="icon-button" :title="site.status === 'paused' ? '启用' : '暂停'" @click="toggleStatus(site)">{{ site.status === 'paused' ? '启' : '停' }}</button>
@@ -313,6 +453,72 @@ onMounted(loadSites)
           </div>
         </article>
       </div>
+    </div>
+
+    <div v-if="showEmailTemplatesModal && emailTemplateSite" class="modal-overlay" @click.self="closeEmailTemplates">
+      <section class="panel app-modal email-templates-modal">
+        <div class="panel-title">
+          <div><span class="eyebrow muted">{{ emailTemplateSite.name }}</span><h2>邮件模板</h2><p>每个网站可维护多个邮件标题和富文本正文。</p></div>
+          <button class="modal-close" type="button" @click="closeEmailTemplates">×</button>
+        </div>
+        <div class="template-manager-bar">
+          <form class="template-search" @submit.prevent="loadEmailTemplates">
+            <input v-model="templateSearch" maxlength="100" placeholder="搜索标题或正文">
+            <button class="button small ghost" type="submit" :disabled="templatesLoading">查询</button>
+            <button v-if="templateSearch" class="text-button" type="button" @click="templateSearch = ''; loadEmailTemplates()">清除</button>
+          </form>
+          <button class="button primary" type="button" @click="openNewTemplate">+ 新增模板</button>
+        </div>
+        <div v-if="templatesLoading" class="compact-empty"><span class="loader" /> 正在读取邮件模板…</div>
+        <div v-else-if="!emailTemplates.length" class="empty-state template-empty">
+          <span class="empty-icon">邮</span><h3>{{ templateSearch ? '没有匹配的邮件模板' : '还没有邮件模板' }}</h3>
+          <p>{{ templateSearch ? '尝试更换关键词或清除查询条件。' : '新增后可在这个网站下长期维护多套邮件内容。' }}</p>
+          <button v-if="!templateSearch" class="button primary" type="button" @click="openNewTemplate">新增第一个模板</button>
+        </div>
+        <div v-else class="email-template-list">
+          <article v-for="template in emailTemplates" :key="template.id">
+            <div class="template-main">
+              <div><h3>{{ template.title }}</h3><span>更新于 {{ formatDate(template.updated_at) }}</span></div>
+              <p>{{ templateSummary(template.content_html) }}</p>
+            </div>
+            <div class="template-actions">
+              <button class="button small ghost" type="button" @click="openEditTemplate(template)">编辑</button>
+              <button class="button small ghost danger-text" type="button" @click="removeEmailTemplate(template)">删除</button>
+            </div>
+          </article>
+        </div>
+      </section>
+    </div>
+
+    <div v-if="showTemplateEditorModal && emailTemplateSite" class="modal-overlay editor-overlay" @click.self="closeTemplateEditor">
+      <form class="panel app-modal template-editor-modal" @submit.prevent="saveEmailTemplate" @keydown.ctrl.s.prevent="saveEmailTemplate">
+        <div class="panel-title">
+          <div><span class="eyebrow muted">{{ emailTemplateSite.name }}</span><h2>{{ editingTemplateId === null ? '新增邮件模板' : '编辑邮件模板' }}</h2><p>支持常用文字格式、列表和链接，Ctrl+S 可快速保存。</p></div>
+          <button class="modal-close" type="button" @click="closeTemplateEditor">×</button>
+        </div>
+        <label class="template-title-field"><span>标题</span><input v-model="templateForm.title" required maxlength="200" autofocus placeholder="例如：产品合作询盘回复"></label>
+        <div class="editor-field">
+          <span>正文</span>
+          <div class="rich-toolbar" role="toolbar" aria-label="富文本格式工具">
+            <button type="button" title="加粗" @mousedown.prevent="formatTemplate('bold')"><strong>B</strong></button>
+            <button type="button" title="斜体" @mousedown.prevent="formatTemplate('italic')"><em>I</em></button>
+            <button type="button" title="下划线" @mousedown.prevent="formatTemplate('underline')"><u>U</u></button>
+            <button type="button" title="删除线" @mousedown.prevent="formatTemplate('strikeThrough')"><s>S</s></button>
+            <span class="toolbar-separator" />
+            <button type="button" title="无序列表" @mousedown.prevent="formatTemplate('insertUnorderedList')">• 列表</button>
+            <button type="button" title="有序列表" @mousedown.prevent="formatTemplate('insertOrderedList')">1. 列表</button>
+            <span class="toolbar-separator" />
+            <button type="button" title="添加链接" @mousedown.prevent="addTemplateLink">链接</button>
+            <button type="button" title="清除格式" @mousedown.prevent="formatTemplate('removeFormat')">清除格式</button>
+            <span class="toolbar-spacer" />
+            <button type="button" title="撤销" @mousedown.prevent="formatTemplate('undo')">↶</button>
+            <button type="button" title="重做" @mousedown.prevent="formatTemplate('redo')">↷</button>
+          </div>
+          <div ref="templateEditor" class="rich-editor" contenteditable="true" role="textbox" aria-multiline="true" data-placeholder="请输入邮件正文…" @input="syncTemplateHtml" />
+          <small>正文会保存为安全的富文本 HTML，外部脚本和危险链接会自动移除。</small>
+        </div>
+        <div class="form-actions"><button class="button ghost" type="button" @click="closeTemplateEditor">取消</button><button class="button primary" :disabled="templateSaving">{{ templateSaving ? '保存中…' : '保存模板' }}</button></div>
+      </form>
     </div>
 
     <div v-if="showStrategyModal && editingStrategyId !== null" class="modal-overlay" @click.self="showStrategyModal = false; editingStrategyId = null">
@@ -370,8 +576,11 @@ onMounted(loadSites)
       <div v-else class="audit-findings">
         <article v-for="finding in auditReport.findings" :key="finding.candidate_block_id">
           <div><span :class="['risk-tag', finding.risk_level]">{{ finding.risk_level === 'high' ? '高风险' : finding.risk_level === 'medium' ? '中风险' : '低风险' }}</span><strong>{{ percent(finding.top_score) }}</strong><a :href="finding.candidate_url" target="_blank" rel="noreferrer">查看待上线页面 ↗</a></div>
-          <p>{{ finding.candidate_content }}</p>
-          <small v-if="finding.matches[0]">最相似来源：{{ finding.matches[0].site_name }} · {{ finding.matches[0].page_title || '无页面标题' }}</small>
+          <div class="audit-copy"><small>待检测文案</small><p>{{ finding.candidate_content }}</p></div>
+          <div v-if="finding.matches[0]" class="audit-source">
+            <a :href="finding.matches[0].url" target="_blank" rel="noreferrer">最相似来源：{{ finding.matches[0].site_name }} · {{ finding.matches[0].page_title || '无页面标题' }} <span>↗</span></a>
+            <div><small>相似来源文案</small><p>{{ finding.matches[0].original_content }}</p></div>
+          </div>
         </article>
       </div>
     </section>

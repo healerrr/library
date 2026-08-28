@@ -10,13 +10,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings, get_settings
 from app.database import SessionLocal, get_session
-from app.models import BackgroundJob, ContentBlock, CrawlRun, Page, SimilarityCheck, Site
+from app.models import BackgroundJob, ContentBlock, CrawlRun, EmailTemplate, Page, SimilarityCheck, Site
 from app.schemas import (
     BackgroundJobOut,
     ContentBlockOut,
     ContentBlockPage,
     CrawlSummary,
     CrawlRunOut,
+    EmailTemplateCreate,
+    EmailTemplateOut,
+    EmailTemplateUpdate,
     SimilarityCheckRequest,
     SimilarityCheckResponse,
     SiteCreate,
@@ -45,6 +48,7 @@ def site_dict(
     page_count: int = 0,
     block_count: int = 0,
     outdated_block_count: int = 0,
+    email_template_count: int = 0,
 ) -> dict:
     return {
         "id": site.id,
@@ -66,6 +70,7 @@ def site_dict(
         "page_count": page_count,
         "block_count": block_count,
         "outdated_block_count": outdated_block_count,
+        "email_template_count": email_template_count,
     }
 
 
@@ -266,14 +271,21 @@ async def list_sites(session: AsyncSession = Depends(get_session)):
         .correlate(Site)
         .scalar_subquery()
     )
+    template_count = (
+        select(func.count(EmailTemplate.id))
+        .where(EmailTemplate.site_id == Site.id)
+        .correlate(Site)
+        .scalar_subquery()
+    )
     rows = (
         await session.execute(
-            select(Site, page_count, block_count, outdated_count).order_by(Site.created_at.desc())
+            select(Site, page_count, block_count, outdated_count, template_count)
+            .order_by(Site.created_at.desc())
         )
     ).all()
     return [
-        site_dict(site, int(pages), int(blocks), int(outdated))
-        for site, pages, blocks, outdated in rows
+        site_dict(site, int(pages), int(blocks), int(outdated), int(templates))
+        for site, pages, blocks, outdated, templates in rows
     ]
 
 
@@ -315,7 +327,10 @@ async def update_site(site_id: int, payload: SiteUpdate, session: AsyncSession =
     await session.refresh(site)
     pages = int((await session.scalar(select(func.count(Page.id)).where(Page.site_id == site.id))) or 0)
     blocks = int((await session.scalar(select(func.count(ContentBlock.id)).where(ContentBlock.site_id == site.id))) or 0)
-    return site_dict(site, pages, blocks)
+    templates = int(
+        (await session.scalar(select(func.count(EmailTemplate.id)).where(EmailTemplate.site_id == site.id))) or 0
+    )
+    return site_dict(site, pages, blocks, email_template_count=templates)
 
 
 @router.delete("/sites/{site_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -324,6 +339,108 @@ async def delete_site(site_id: int, session: AsyncSession = Depends(get_session)
     if site is None:
         raise HTTPException(status_code=404, detail="网站不存在")
     await session.delete(site)
+    await session.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+async def get_email_template_or_404(
+    session: AsyncSession,
+    site_id: int,
+    template_id: int,
+) -> EmailTemplate:
+    template = await session.scalar(
+        select(EmailTemplate).where(
+            EmailTemplate.id == template_id,
+            EmailTemplate.site_id == site_id,
+        )
+    )
+    if template is None:
+        raise HTTPException(status_code=404, detail="邮件模板不存在")
+    return template
+
+
+@router.get("/sites/{site_id}/email-templates", response_model=list[EmailTemplateOut])
+async def list_email_templates(
+    site_id: int,
+    search: str | None = Query(default=None, max_length=100),
+    session: AsyncSession = Depends(get_session),
+):
+    if await session.get(Site, site_id) is None:
+        raise HTTPException(status_code=404, detail="网站不存在")
+    statement = select(EmailTemplate).where(EmailTemplate.site_id == site_id)
+    if search and (term := search.strip()):
+        pattern = f"%{term}%"
+        statement = statement.where(
+            or_(EmailTemplate.title.ilike(pattern), EmailTemplate.content_html.ilike(pattern))
+        )
+    return (
+        await session.scalars(
+            statement.order_by(EmailTemplate.updated_at.desc(), EmailTemplate.id.desc())
+        )
+    ).all()
+
+
+@router.get(
+    "/sites/{site_id}/email-templates/{template_id}",
+    response_model=EmailTemplateOut,
+)
+async def get_email_template(
+    site_id: int,
+    template_id: int,
+    session: AsyncSession = Depends(get_session),
+):
+    return await get_email_template_or_404(session, site_id, template_id)
+
+
+@router.post(
+    "/sites/{site_id}/email-templates",
+    response_model=EmailTemplateOut,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_email_template(
+    site_id: int,
+    payload: EmailTemplateCreate,
+    session: AsyncSession = Depends(get_session),
+):
+    if await session.get(Site, site_id) is None:
+        raise HTTPException(status_code=404, detail="网站不存在")
+    template = EmailTemplate(site_id=site_id, **payload.model_dump())
+    session.add(template)
+    await session.commit()
+    await session.refresh(template)
+    return template
+
+
+@router.patch(
+    "/sites/{site_id}/email-templates/{template_id}",
+    response_model=EmailTemplateOut,
+)
+async def update_email_template(
+    site_id: int,
+    template_id: int,
+    payload: EmailTemplateUpdate,
+    session: AsyncSession = Depends(get_session),
+):
+    template = await get_email_template_or_404(session, site_id, template_id)
+    for key, value in payload.model_dump(exclude_unset=True).items():
+        setattr(template, key, value)
+    template.updated_at = datetime.now(timezone.utc)
+    await session.commit()
+    await session.refresh(template)
+    return template
+
+
+@router.delete(
+    "/sites/{site_id}/email-templates/{template_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def delete_email_template(
+    site_id: int,
+    template_id: int,
+    session: AsyncSession = Depends(get_session),
+):
+    template = await get_email_template_or_404(session, site_id, template_id)
+    await session.delete(template)
     await session.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 

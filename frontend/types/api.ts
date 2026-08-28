@@ -18,6 +18,16 @@ export interface Site {
   page_count: number
   block_count: number
   outdated_block_count: number
+  email_template_count: number
+}
+
+export interface EmailTemplate {
+  id: number
+  site_id: number
+  title: string
+  content_html: string
+  created_at: string
+  updated_at: string
 }
 
 export interface Stats {
