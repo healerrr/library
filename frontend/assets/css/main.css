@@ -274,7 +274,6 @@ input:focus, select:focus, textarea:focus { border-color: var(--purple); box-sha
 .strategy-panel, .result-panel { margin-top: 22px; padding: 24px; }
 .policy-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 17px; margin-top: 22px; }
 .policy-grid label { display: flex; flex-direction: column; gap: 8px; }
-.policy-grid label > small { color: var(--muted); font-size: 9px; line-height: 1.6; }
 .policy-grid textarea { min-height: 118px; resize: vertical; border-radius: 10px; padding: 12px 13px; font-size: 12px; line-height: 1.65; }
 .policy-note { margin-top: 17px; border-radius: 10px; padding: 11px 13px; background: rgba(246,169,40,.1); color: var(--amber); font-size: 10px; line-height: 1.7; }
 .preview-summary { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 22px 0; }

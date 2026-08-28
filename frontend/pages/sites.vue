@@ -288,12 +288,12 @@ onMounted(loadSites)
 
     <form v-if="editingStrategyId !== null" class="panel strategy-panel" @submit.prevent="saveStrategy">
       <div class="panel-title">
-        <div><span class="eyebrow muted">每站独立配置</span><h2>采集策略</h2><p>每行填写一个路径；首页始终保留，不受包含路径限制。</p></div>
+        <div><span class="eyebrow muted">每站独立配置</span><h2>采集策略</h2><p>正则规则按 URL 路径匹配；首页始终保留，不受包含规则限制。</p></div>
         <button class="text-button" type="button" @click="editingStrategyId = null">关闭</button>
       </div>
       <div class="policy-grid">
-        <label><span>只包含这些路径（每行一条，留空表示不限制）</span><textarea v-model="strategyForm.includePatterns" rows="5" placeholder="/about\n/news/"></textarea><small>/about 只匹配当前页面；/about/ 同时匹配当前页面和全部子页面。</small></label>
-        <label><span>排除这些路径（每行一条）</span><textarea v-model="strategyForm.excludePatterns" rows="5" placeholder="/search\n/member/"></textarea><small>末尾不带 / 表示单页，末尾带 / 表示整个路径目录。</small></label>
+        <label><span>只包含这些路由（每行一条正则，留空表示不限制）</span><textarea v-model="strategyForm.includePatterns" rows="5" placeholder="^/about\n^/news"></textarea></label>
+        <label><span>排除这些路由（每行一条正则）</span><textarea v-model="strategyForm.excludePatterns" rows="5" placeholder="^/search\n^/member"></textarea></label>
         <label><span>允许保留的查询参数</span><input v-model="strategyForm.allowedQueryParams" placeholder="例如：page, lang"></label>
         <label><span>最多采集页面（留空使用系统默认值）</span><input v-model="strategyForm.crawlerMaxPages" inputmode="numeric" pattern="[0-9]*" placeholder="例如：300"></label>
         <label><span>请求间隔（毫秒）</span><input v-model.number="strategyForm.requestDelayMs" type="number" min="0" max="5000" step="100"></label>

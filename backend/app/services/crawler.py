@@ -240,30 +240,6 @@ def crawl_link_priority(url: str) -> tuple[int, int, str]:
     return content_priority, len(segments), url
 
 
-def route_rule_matches(rule: str, target_path: str) -> bool:
-    """Match human-friendly route rules while retaining legacy regex support.
-
-    `/about` matches only the route page (with or without its trailing slash),
-    while `/about/` also matches every descendant such as `/about/team`.
-    Existing rules beginning with `^`, and explicit `re:` rules, remain regex.
-    """
-    cleaned_rule = unquote(rule.strip())
-    cleaned_target = unquote(target_path or "/")
-    if cleaned_rule.startswith("re:"):
-        return bool(re.search(cleaned_rule[3:], cleaned_target, re.IGNORECASE))
-    if cleaned_rule.startswith("^"):
-        return bool(re.search(cleaned_rule, cleaned_target, re.IGNORECASE))
-
-    normalized_rule = f"/{cleaned_rule.lstrip('/')}"
-    normalized_target = f"/{cleaned_target.lstrip('/')}"
-    rule_key = normalized_rule.casefold()
-    target_key = normalized_target.casefold()
-    if rule_key != "/" and rule_key.endswith("/"):
-        route_page = rule_key.rstrip("/")
-        return target_key.rstrip("/") == route_page or target_key.startswith(rule_key)
-    return target_key.rstrip("/") == rule_key.rstrip("/")
-
-
 def crawl_policy_reason(url: str, site: Site, *, homepage: str | None = None) -> str | None:
     if homepage and url.rstrip("/") == homepage.rstrip("/"):
         return None
@@ -271,13 +247,13 @@ def crawl_policy_reason(url: str, site: Site, *, homepage: str | None = None) ->
         return "产品目录或动态数据路由"
     target = unquote(urlsplit(url).path)
     for pattern in site.exclude_patterns or []:
-        if route_rule_matches(pattern, target):
-            return f"命中排除路径：{pattern}"
+        if re.search(pattern, target, re.IGNORECASE):
+            return f"命中排除规则：{pattern}"
     include_patterns = site.include_patterns or []
     if include_patterns and not any(
-        route_rule_matches(pattern, target) for pattern in include_patterns
+        re.search(pattern, target, re.IGNORECASE) for pattern in include_patterns
     ):
-        return "不在包含路径内"
+        return "不在包含规则内"
     return None
 
 
@@ -437,7 +413,6 @@ class CrawlerService:
 
     async def crawl(self, session: AsyncSession, site: Site) -> dict:
         site_id = site.id
-        minimum_coverage = float(site.min_crawl_coverage)
         domains = {site.domain}
         maximum = site.crawler_max_pages or self.settings.crawler_max_pages
         allowed_query_params = set(site.allowed_query_params or [])
@@ -455,7 +430,6 @@ class CrawlerService:
         session.add(crawl_run)
         await session.commit()
         await session.refresh(crawl_run)
-        crawl_run_id = int(crawl_run.id)
 
         async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
             # The homepage is the source of truth.  Following only same-domain
@@ -575,52 +549,26 @@ class CrawlerService:
                     pages_crawled += 1
                     blocks_saved += len(unique_blocks)
                 except Exception as exc:  # Keep one bad page from aborting the site crawl.
-                    error_message = str(exc)[:180]
                     await session.rollback()
-                    # rollback() expires ORM attributes even when
-                    # expire_on_commit=False. Explicit refresh prevents a
-                    # later policy read from triggering forbidden implicit IO.
-                    await session.refresh(site)
-                    errors.append(f"{url}: {error_message}")
+                    errors.append(f"{url}: {str(exc)[:180]}")
 
         stored_pages = list((await session.scalars(select(Page).where(Page.site_id == site_id))).all())
-        policy_excluded_pages = [
-            page
-            for page in stored_pages
-            if crawl_policy_reason(page.url, site, homepage=homepage)
-        ]
-        policy_eligible_pages = [
-            page
-            for page in stored_pages
-            if not crawl_policy_reason(page.url, site, homepage=homepage)
-        ]
-        eligible_stale_pages = [
-            page for page in policy_eligible_pages if page.url not in retained_urls
-        ]
-        stale_pages = len(policy_excluded_pages) + len(eligible_stale_pages)
-        retained_existing = sum(page.url in retained_urls for page in policy_eligible_pages)
-        coverage = (
-            retained_existing / len(policy_eligible_pages)
-            if policy_eligible_pages
-            else 1.0
-        )
+        stale_pages = sum(page.url not in retained_urls for page in stored_pages)
+        coverage = len(retained_urls) / previous_pages if previous_pages else 1.0
         prune_blocked = should_block_page_pruning(
-            stale_pages=len(eligible_stale_pages),
+            stale_pages=stale_pages,
             coverage=coverage,
-            minimum_coverage=minimum_coverage,
+            minimum_coverage=site.min_crawl_coverage,
             errors=errors,
         )
-        # Explicit route exclusions are intentional and must take effect even
-        # when the safety guard preserves unexpectedly missing eligible pages.
-        await remove_pages_by_ids(session, [page.id for page in policy_excluded_pages])
-        if not prune_blocked:
-            await remove_pages_by_ids(session, [page.id for page in eligible_stale_pages])
+        if retained_urls and not prune_blocked:
+            await remove_pages_not_retained(session, site_id, retained_urls)
         await deduplicate_site_blocks(session, site_id)
         managed_site = await session.get(Site, site_id)
         if managed_site is not None:
             managed_site.last_crawled_at = datetime.now(timezone.utc)
             managed_site.status = "active" if pages_crawled or self._skipped_dynamic_urls else "error"
-        crawl_run = await session.get(CrawlRun, crawl_run_id)
+        crawl_run = await session.get(CrawlRun, crawl_run.id)
         if crawl_run is not None:
             crawl_run.status = "completed_with_warnings" if errors or prune_blocked else "completed"
             crawl_run.pages_discovered = len(discovered)
@@ -690,13 +638,8 @@ async def remove_pages_not_retained(session: AsyncSession, site_id: int, retaine
     """Drop stale pages left by older sitemap-based crawls."""
     pages = list((await session.scalars(select(Page).where(Page.site_id == site_id))).all())
     stale_page_ids = [page.id for page in pages if page.url not in retained_urls]
-    return await remove_pages_by_ids(session, stale_page_ids)
-
-
-async def remove_pages_by_ids(session: AsyncSession, page_ids: list[int]) -> int:
-    """Delete selected pages and their copy blocks without lazy-loading relationships."""
-    if not page_ids:
+    if not stale_page_ids:
         return 0
-    await session.execute(delete(ContentBlock).where(ContentBlock.page_id.in_(page_ids)))
-    await session.execute(delete(Page).where(Page.id.in_(page_ids)))
-    return len(page_ids)
+    await session.execute(delete(ContentBlock).where(ContentBlock.page_id.in_(stale_page_ids)))
+    await session.execute(delete(Page).where(Page.id.in_(stale_page_ids)))
+    return len(stale_page_ids)
